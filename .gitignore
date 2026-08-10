@@ -1,0 +1,5 @@
+/target
+
+# Local API endpoint config; copy .env.example to .env and adjust.
+.env
+/ux0:app
