@@ -1,14 +1,25 @@
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 pub const API_BASE: &str = env!("VITADECK_API_BASE");
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_REDIRECTS: u32 = 10;
-const USER_AGENT: &str = "VitaDeck";
+const USER_AGENT: &str = "Mozilla/5.0 (PlayStation Vita 3.60) AppleWebKit/537.73 (KHTML, like Gecko) VitaDeck/1.0";
+
+static CLIENT_ID: OnceLock<String> = OnceLock::new();
+
+pub fn set_client_id(id: String) {
+    let _ = CLIENT_ID.set(id);
+}
+
+fn client_id() -> &'static str {
+    CLIENT_ID.get().map(String::as_str).unwrap_or("vitadeck-unset")
+}
 
 fn tls_config() -> Arc<rustls::ClientConfig> {
     static CONFIG: OnceLock<Arc<rustls::ClientConfig>> = OnceLock::new();
@@ -29,14 +40,19 @@ pub fn init() -> Result<(), String> {
     #[cfg(target_os = "vita")]
     unsafe {
         use vitasdk_sys::*;
-        let _ = sceSysmoduleLoadModule(SCE_SYSMODULE_NET);
+        let module_ret = sceSysmoduleLoadModule(SCE_SYSMODULE_NET);
         let mut param = SceNetInitParam {
             memory: Box::leak(vec![0u8; 1024 * 1024].into_boxed_slice()).as_mut_ptr() as *mut _,
             size: 1024 * 1024,
             flags: 0,
         };
-        let _ = sceNetInit(&mut param);
-        let _ = sceNetCtlInit();
+        let init_ret = sceNetInit(&mut param);
+        let ctl_ret = sceNetCtlInit();
+        if module_ret < 0 || init_ret < 0 || ctl_ret < 0 {
+            crate::scanner::write_append_log(&format!(
+                "net init: module={module_ret} net={init_ret} ctl={ctl_ret}"
+            ));
+        }
     }
     Ok(())
 }
@@ -94,8 +110,8 @@ fn request_once(
     }
 
     let request = format!(
-        "{} {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: {}\r\nAccept: application/json, */*\r\nConnection: close\r\n\r\n",
-        method, url.path, url.host, USER_AGENT
+        "{} {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: {}\r\nX-Client-ID: {}\r\nAccept: application/json, */*\r\nConnection: close\r\n\r\n",
+        method, url.path, url.host, USER_AGENT, client_id()
     );
 
     let mut reader: Box<dyn Read> = if url.https {
@@ -115,7 +131,7 @@ fn request_once(
         Box::new(tcp)
     };
 
-    read_response(&mut reader, max_bytes, method == "HEAD")
+    read_response(&mut reader, max_bytes, method == "HEAD", &url.host)
 }
 
 struct RustlsOwnedStream {
@@ -133,6 +149,7 @@ fn read_response(
     reader: &mut dyn Read,
     max_bytes: usize,
     head_only: bool,
+    host_key: &str,
 ) -> Result<(u16, Option<String>, Option<usize>, Vec<u8>), String> {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 4096];
@@ -158,6 +175,7 @@ fn read_response(
     let mut content_length: Option<usize> = None;
     let mut chunked = false;
     let mut location: Option<String> = None;
+    let mut retry_after_secs: Option<u64> = None;
     for line in lines {
         let Some((key, val)) = line.split_once(':') else { continue };
         let key = key.trim().to_ascii_lowercase();
@@ -166,8 +184,15 @@ fn read_response(
             "content-length" => content_length = val.parse().ok(),
             "transfer-encoding" if val.eq_ignore_ascii_case("chunked") => chunked = true,
             "location" => location = Some(val.to_string()),
+            "x-ratelimit-after" | "retry-after" if retry_after_secs.is_none() => {
+                retry_after_secs = val.parse().ok();
+            }
             _ => {}
         }
+    }
+
+    if status == 429 {
+        note_rate_limited(&host_key, retry_after_secs.unwrap_or(DEFAULT_RATE_LIMIT_SECS));
     }
 
     if head_only {
@@ -251,14 +276,106 @@ fn read_chunked(reader: &mut dyn Read, mut leftover: Vec<u8>, max_bytes: usize) 
     Ok(out)
 }
 
+fn stream_chunked_to_writer(
+    reader: &mut dyn Read,
+    writer: &mut dyn Write,
+    mut leftover: Vec<u8>,
+    max_bytes: usize,
+) -> Result<(), String> {
+    let mut written = 0usize;
+    let mut buf = [0u8; 8192];
+    loop {
+        let size_end = loop {
+            if let Some(pos) = find_subslice(&leftover, b"\r\n") {
+                break pos;
+            }
+            let n = reader.read(&mut buf).map_err(|e| e.to_string())?;
+            if n == 0 {
+                return Err("connection closed mid-chunk-header".to_string());
+            }
+            leftover.extend_from_slice(&buf[..n]);
+        };
+        let size_line = String::from_utf8_lossy(&leftover[..size_end]);
+        let size_str = size_line.split(';').next().unwrap_or("").trim();
+        let size = usize::from_str_radix(size_str, 16).map_err(|_| "bad chunk size".to_string())?;
+        leftover.drain(..size_end + 2);
+
+        if size == 0 {
+            break;
+        }
+        if written + size > max_bytes {
+            return Err("response exceeds max size".to_string());
+        }
+
+        let mut remaining = size;
+        while remaining > 0 {
+            if leftover.is_empty() {
+                let n = reader.read(&mut buf).map_err(|e| e.to_string())?;
+                if n == 0 {
+                    return Err("connection closed mid-chunk".to_string());
+                }
+                leftover.extend_from_slice(&buf[..n]);
+            }
+            let take = remaining.min(leftover.len());
+            writer.write_all(&leftover[..take]).map_err(|e| e.to_string())?;
+            leftover.drain(..take);
+            remaining -= take;
+            written += take;
+        }
+
+        while leftover.len() < 2 {
+            let n = reader.read(&mut buf).map_err(|e| e.to_string())?;
+            if n == 0 {
+                return Err("connection closed mid-chunk".to_string());
+            }
+            leftover.extend_from_slice(&buf[..n]);
+        }
+        leftover.drain(..2);
+    }
+    Ok(())
+}
+
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+const DEFAULT_RATE_LIMIT_SECS: u64 = 5;
+
+fn rate_limit_table() -> &'static Mutex<HashMap<String, Instant>> {
+    static TABLE: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
+    TABLE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn note_rate_limited(host: &str, wait_secs: u64) {
+    let until = Instant::now() + Duration::from_secs(wait_secs);
+    if let Ok(mut table) = rate_limit_table().lock() {
+        table.insert(host.to_string(), until);
+    }
+}
+
+fn rate_limit_remaining(host: &str) -> Option<Duration> {
+    let table = rate_limit_table().lock().ok()?;
+    let until = *table.get(host)?;
+    let now = Instant::now();
+    if until > now {
+        Some(until - now)
+    } else {
+        None
+    }
+}
+
+fn check_rate_limit(host: &str) -> Result<(), String> {
+    if let Some(remaining) = rate_limit_remaining(host) {
+        return Err(format!("rate limited by {host}, retry in {}s", remaining.as_secs() + 1));
+    }
+    Ok(())
 }
 
 pub fn request(url: &str, max_bytes: usize, method: &str) -> Result<(Vec<u8>, Option<usize>), String> {
     let mut current = url.to_string();
     for _ in 0..MAX_REDIRECTS {
         let parsed = parse_url(&current)?;
+        check_rate_limit(&parsed.host)?;
         let (status, location, content_length, body) = request_once(&parsed, max_bytes, method)?;
         match status {
             200..=299 => return Ok((body, content_length)),
@@ -286,6 +403,7 @@ pub fn download_to_file(url: &str, path: &str, max_bytes: usize) -> Result<(), S
     let mut current = url.to_string();
     for _ in 0..MAX_REDIRECTS {
         let parsed = parse_url(&current)?;
+        check_rate_limit(&parsed.host)?;
         let tcp = TcpStream::connect((parsed.host.as_str(), parsed.port)).map_err(|e| e.to_string())?;
         #[cfg(not(target_os = "vita"))]
         {
@@ -294,8 +412,8 @@ pub fn download_to_file(url: &str, path: &str, max_bytes: usize) -> Result<(), S
         }
 
         let request = format!(
-            "GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: {}\r\nAccept: */*\r\nConnection: close\r\n\r\n",
-            parsed.path, parsed.host, USER_AGENT
+            "GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: {}\r\nX-Client-ID: {}\r\nAccept: */*\r\nConnection: close\r\n\r\n",
+            parsed.path, parsed.host, USER_AGENT, client_id()
         );
 
         let mut reader: Box<dyn Read> = if parsed.https {
@@ -316,7 +434,7 @@ pub fn download_to_file(url: &str, path: &str, max_bytes: usize) -> Result<(), S
         };
 
         let (status, location, content_length, leftover, chunked) =
-            read_response_headers(&mut reader)?;
+            read_response_headers(&mut reader, &parsed.host)?;
         match status {
             200..=299 => {
                 if let Some(len) = content_length {
@@ -359,12 +477,9 @@ pub fn download_to_file(url: &str, path: &str, max_bytes: usize) -> Result<(), S
     Err("too many redirects".to_string())
 }
 
-pub fn fetch_content_length(url: &str) -> Option<usize> {
-    request(url, 0, "HEAD").ok().and_then(|(_, len)| len)
-}
-
 fn read_response_headers(
     reader: &mut dyn Read,
+    host_key: &str,
 ) -> Result<(u16, Option<String>, Option<usize>, Vec<u8>, bool), String> {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 4096];
@@ -394,6 +509,7 @@ fn read_response_headers(
     let mut content_length: Option<usize> = None;
     let mut chunked = false;
     let mut location: Option<String> = None;
+    let mut retry_after_secs: Option<u64> = None;
     for line in lines {
         let Some((key, val)) = line.split_once(':') else { continue };
         let key = key.trim().to_ascii_lowercase();
@@ -402,8 +518,15 @@ fn read_response_headers(
             "content-length" => content_length = val.parse().ok(),
             "transfer-encoding" if val.eq_ignore_ascii_case("chunked") => chunked = true,
             "location" => location = Some(val.to_string()),
+            "x-ratelimit-after" | "retry-after" if retry_after_secs.is_none() => {
+                retry_after_secs = val.parse().ok();
+            }
             _ => {}
         }
+    }
+
+    if status == 429 {
+        note_rate_limited(host_key, retry_after_secs.unwrap_or(DEFAULT_RATE_LIMIT_SECS));
     }
 
     let leftover = buf[header_end + 4..].to_vec();
@@ -422,9 +545,7 @@ fn stream_body_to_writer(
     let mut chunk = [0u8; 8192];
 
     if chunked {
-        let body = read_chunked(reader, leftover, max_bytes)?;
-        writer.write_all(&body).map_err(|e| e.to_string())?;
-        return Ok(());
+        return stream_chunked_to_writer(reader, writer, leftover, max_bytes);
     }
 
     if !leftover.is_empty() {

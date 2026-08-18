@@ -3,6 +3,7 @@ use crate::scanner::{cover_cache_path, hero_cache_path, logo_cache_path, music_c
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::mpsc::Sender;
+use std::sync::{Mutex, OnceLock};
 
 pub struct ArtJob {
     pub title_id: String,
@@ -13,8 +14,13 @@ pub struct ArtJob {
     pub known_cover_url: Option<String>,
     pub known_screenshot_url: Option<String>,
     pub known_logo_url: Option<String>,
+    pub known_icon_url: Option<String>,
 
     pub known_music_url: Option<String>,
+
+    pub store_only: bool,
+    pub skip_disk: bool,
+    pub music_only: bool,
 }
 
 #[derive(Clone)]
@@ -29,6 +35,10 @@ pub struct ArtResult {
     pub hero: Option<ImageData>,
     pub logo: Option<ImageData>,
 
+    pub cover_ok: bool,
+    pub hero_ok: bool,
+    pub logo_ok: bool,
+
     pub music_downloaded: bool,
     pub error: Option<String>,
 
@@ -41,8 +51,6 @@ const MAX_JSON_BYTES: usize = 64 * 1024;
 const MAX_IMAGE_BYTES: usize = 2 * 1024 * 1024;
 
 const MAX_MUSIC_BYTES: usize = 12 * 1024 * 1024;
-
-const PREFERRED_IMAGE_BYTES: usize = 800 * 1024;
 
 fn asset_url(path: &str) -> String {
     if path.starts_with("http://") || path.starts_with("https://") {
@@ -60,17 +68,40 @@ fn is_png(bytes: &[u8]) -> bool {
     bytes.len() >= 8 && &bytes[0..8] == b"\x89PNG\r\n\x1a\n"
 }
 
-fn fetch_image(url: &str) -> Option<ImageData> {
+pub fn fetch_image(url: &str) -> Option<ImageData> {
     let bytes = match net::download_to_vec(url, MAX_IMAGE_BYTES) {
         Ok(b) => b,
         Err(err) => {
-            crate::scanner::write_append_log(&format!("fetch_image failed for {}: {}", url, err));
+            let err_text = err.to_string();
+            if err_text.contains("HTTP 404") {
+                static LOGGED_404: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+                let seen = LOGGED_404.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
+                let key = format!("{}|404", url);
+                let mut should_log = true;
+                if let Ok(mut guard) = seen.lock() {
+                    should_log = guard.insert(key);
+                }
+                if should_log {
+                    crate::scanner::write_append_log(&format!("fetch_image missing asset (404) for {}", url));
+                }
+            } else {
+                crate::scanner::write_append_log(&format!(
+                    "fetch_image failed for {}: {}",
+                    url, err_text
+                ));
+            }
             return None;
         }
     };
     if is_png(&bytes) {
+        if is_placeholder_image(&bytes) {
+            return None;
+        }
         Some(ImageData { is_png: true, bytes })
     } else if is_jpeg(&bytes) {
+        if is_placeholder_image(&bytes) {
+            return None;
+        }
         Some(ImageData { is_png: false, bytes })
     } else {
         crate::scanner::write_append_log(&format!(
@@ -80,6 +111,27 @@ fn fetch_image(url: &str) -> Option<ImageData> {
         ));
         None
     }
+}
+
+pub fn is_placeholder_image(bytes: &[u8]) -> bool {
+    if bytes.len() < 64 {
+        return true;
+    }
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes));
+    if is_png(bytes) {
+        reader.set_format(image::ImageFormat::Png);
+    } else if is_jpeg(bytes) {
+        reader.set_format(image::ImageFormat::Jpeg);
+    } else {
+        return false;
+    }
+    let Ok((w, h)) = reader.into_dimensions() else {
+        return false;
+    };
+    if w.max(h) < 24 {
+        return true;
+    }
+    w == h && w >= 128 && bytes.len() <= 12_000
 }
 
 pub fn save_to_cache(image: &ImageData, base_path_no_ext: &str) {
@@ -100,7 +152,18 @@ fn fetch_and_cache_music(url: &str, system: System, art_key: &str) -> bool {
         let _ = std::fs::create_dir_all(parent);
     }
     if let Err(err) = net::download_to_file(url, &tmp, MAX_MUSIC_BYTES) {
-        crate::scanner::write_append_log(&format!("fetch_music failed for {}: {}", url, err));
+        let err_text = err.to_string();
+        if err_text.contains("HTTP 404") {
+            crate::scanner::write_append_log(&format!(
+                "fetch_music missing asset (404) for {} [{}]",
+                url, art_key
+            ));
+        } else {
+            crate::scanner::write_append_log(&format!(
+                "fetch_music network/transport failed for {} [{}]: {}",
+                url, art_key, err_text
+            ));
+        }
         let _ = std::fs::remove_file(&tmp);
         return false;
     }
@@ -110,6 +173,7 @@ fn fetch_and_cache_music(url: &str, system: System, art_key: &str) -> bool {
             url, tmp
         ));
         let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(&path);
         return false;
     }
     std::fs::rename(&tmp, &path).is_ok()
@@ -136,6 +200,9 @@ pub fn resolve(job: ArtJob, tx: &Sender<ArtResult>) {
             cover: None,
             hero: None,
             logo: None,
+            cover_ok: false,
+            hero_ok: false,
+            logo_ok: false,
             music_downloaded: false,
             error: Some("no wifi".to_string()),
             job_complete: true,
@@ -144,28 +211,128 @@ pub fn resolve(job: ArtJob, tx: &Sender<ArtResult>) {
         return;
     }
 
-    let cover = job.known_cover_url.as_deref().and_then(fetch_image);
-    let hero = job.known_screenshot_url.as_deref().and_then(fetch_image);
-    let logo = job.known_logo_url.as_deref().and_then(fetch_image);
+    if job.music_only {
+        let url = job
+            .known_music_url
+            .clone()
+            .unwrap_or_else(|| asset_url(&format!("music/{}.mp3", job.art_key)));
+        let _ = music_worker_sender().send(MusicJob {
+            title_id: job.title_id,
+            system: job.system,
+            art_key: job.art_key,
+            url,
+            images_ok: true,
+            tx: tx.clone(),
+        });
+        return;
+    }
 
-    if let Some(cover) = &cover {
-        save_to_cache(cover, &cover_cache_path(job.system, &job.art_key));
-    }
-    if let Some(hero) = &hero {
-        save_to_cache(hero, &hero_cache_path(job.system, &job.art_key));
-    }
-    if let Some(logo) = &logo {
-        save_to_cache(logo, &logo_cache_path(job.system, &job.art_key));
+    let mut cover = None;
+    let mut hero = None;
+    let mut logo = None;
+    let mut music_url = job.known_music_url.clone();
+
+    if job.skip_disk {
+        cover = job.known_cover_url.as_deref().and_then(fetch_image);
+        if cover.is_none() {
+            cover = job.known_screenshot_url.as_deref().and_then(fetch_image);
+        }
+        if cover.is_none() {
+            cover = job.known_icon_url.as_deref().and_then(fetch_image);
+        }
+    } else {
+        let mut lookup_detail = lookup_one(&job.title_id);
+        if lookup_detail.is_none() && !job.store_only {
+            lookup_detail = lookup_by_query(&job.title, job.system);
+        }
+
+        if let Some(detail) = &lookup_detail {
+            if cover.is_none() {
+                cover = detail.cover_url.as_deref().and_then(fetch_image);
+            }
+            if !job.store_only {
+                if hero.is_none() {
+                    hero = detail.screenshot_url.as_deref().and_then(fetch_image);
+                }
+                if logo.is_none() {
+                    logo = detail.logo_url.as_deref().and_then(fetch_image);
+                }
+            }
+            if music_url.is_none() {
+                music_url = detail.music_url.clone();
+            }
+        }
+
+        if cover.is_none() {
+            cover = fetch_image(&conventional_cover_url(&job.art_key));
+        }
+
+        if cover.is_none() {
+            cover = job.known_cover_url.as_deref().and_then(fetch_image);
+        }
+
+        if cover.is_none() && job.system == System::Vita {
+            let vf_cover = format!(
+                "https://vitaforge.josephinoo.dev/api/v1/images/cover/{}?size=medium&format=jpeg",
+                job.title_id
+            );
+            if job.known_cover_url.as_deref() != Some(vf_cover.as_str()) {
+                cover = fetch_image(&vf_cover);
+            }
+        }
+
+        if cover.is_none() {
+            cover = job.known_screenshot_url.as_deref().and_then(fetch_image);
+        }
+
+        if cover.is_none() {
+            cover = job.known_icon_url.as_deref().and_then(fetch_image);
+        }
+
+        if !job.store_only {
+            if hero.is_none() {
+                hero = job.known_screenshot_url.as_deref().and_then(fetch_image);
+            }
+            if hero.is_none() {
+                hero = fetch_image(&conventional_hero_url(&job.art_key));
+            }
+            if logo.is_none() {
+                logo = job.known_logo_url.as_deref().and_then(fetch_image);
+            }
+            if logo.is_none() {
+                logo = fetch_image(&conventional_logo_url(&job.art_key));
+            }
+            if music_url.is_none() {
+                music_url = Some(asset_url(&format!("music/{}.mp3", job.art_key)));
+            }
+        }
     }
 
-    let images_ok = cover.is_some() || hero.is_some() || logo.is_some();
-    let music_url = job.known_music_url.clone();
+    if !job.skip_disk {
+        if let Some(cover) = &cover {
+            save_to_cache(cover, &cover_cache_path(job.system, &job.art_key));
+        }
+        if let Some(hero) = &hero {
+            save_to_cache(hero, &hero_cache_path(job.system, &job.art_key));
+        }
+        if let Some(logo) = &logo {
+            save_to_cache(logo, &logo_cache_path(job.system, &job.art_key));
+        }
+    }
+
+    let cover_ok = cover.is_some();
+    let hero_ok = hero.is_some();
+    let logo_ok = logo.is_some();
+    let images_ok = cover_ok || hero_ok || logo_ok;
 
     let _ = tx.send(ArtResult {
         title_id: job.title_id.clone(),
         cover,
         hero,
         logo,
+        cover_ok,
+        hero_ok,
+        logo_ok,
         music_downloaded: false,
         error: if !images_ok && music_url.is_none() {
             let err_msg = format!("no art found for {} [{}]", job.title, job.art_key);
@@ -179,32 +346,58 @@ pub fn resolve(job: ArtJob, tx: &Sender<ArtResult>) {
     });
 
     if let Some(url) = music_url {
-        let tx = tx.clone();
-        let title_id = job.title_id.clone();
-        let system = job.system;
-        let art_key = job.art_key.clone();
-        let images_ok = images_ok;
-        std::thread::spawn(move || {
-            let music_downloaded = fetch_and_cache_music(&url, system, &art_key);
-            if !music_downloaded {
-                crate::scanner::write_append_log(&format!(
-                    "music download failed for {} [{}]",
-                    title_id, art_key
-                ));
-            }
-            let _ = tx.send(ArtResult {
-                title_id,
-                cover: None,
-                hero: None,
-                logo: None,
-                music_downloaded,
-                error: None,
-
-                job_complete: false,
-                images_ok,
-            });
-        });
+        let job = MusicJob {
+            title_id: job.title_id.clone(),
+            system: job.system,
+            art_key: job.art_key.clone(),
+            url,
+            images_ok,
+            tx: tx.clone(),
+        };
+        let _ = music_worker_sender().send(job);
     }
+}
+
+struct MusicJob {
+    title_id: String,
+    system: System,
+    art_key: String,
+    url: String,
+    images_ok: bool,
+    tx: Sender<ArtResult>,
+}
+
+fn music_worker_sender() -> &'static Sender<MusicJob> {
+    use std::sync::OnceLock;
+    static SENDER: OnceLock<Sender<MusicJob>> = OnceLock::new();
+    SENDER.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<MusicJob>();
+        std::thread::spawn(move || {
+            while let Ok(job) = rx.recv() {
+                let music_downloaded = fetch_and_cache_music(&job.url, job.system, &job.art_key);
+                if !music_downloaded {
+                    crate::scanner::write_append_log(&format!(
+                        "music download failed for {} [{}]",
+                        job.title_id, job.art_key
+                    ));
+                }
+                let _ = job.tx.send(ArtResult {
+                    title_id: job.title_id,
+                    cover: None,
+                    hero: None,
+                    logo: None,
+                    cover_ok: false,
+                    hero_ok: false,
+                    logo_ok: false,
+                    music_downloaded,
+                    error: None,
+                    job_complete: false,
+                    images_ok: job.images_ok,
+                });
+            }
+        });
+        tx
+    })
 }
 
 const VITADECK_LOOKUP_CACHE: &str = "ux0:data/VitaDeck/APICACHE/vitadeck_lookup.json";
@@ -268,7 +461,7 @@ impl LookupTarget {
 }
 
 fn games_checksum(games: &[LookupTarget]) -> u64 {
-    const LOOKUP_CACHE_VERSION: u64 = 0x0A_00;
+    const LOOKUP_CACHE_VERSION: u64 = 0x0B_00;
     let mut hash: u64 = 0xcbf29ce484222325 ^ LOOKUP_CACHE_VERSION; 
     for g in games {
         for byte in g.art_key.bytes().chain(g.title_id.bytes()) {
@@ -284,8 +477,18 @@ fn select_best_variant(paths: &[String]) -> Option<String> {
 }
 
 fn select_best_logo_variant(paths: &[String]) -> Option<String> {
-
     select_best_variant_preferring(paths, PreferFormat::Png)
+}
+
+fn select_best_music_variant(paths: &[String]) -> Option<String> {
+    paths
+        .iter()
+        .find(|p| {
+            let lower = p.to_ascii_lowercase();
+            lower.ends_with(".mp3") || lower.ends_with(".ogg") || lower.ends_with(".wav")
+        })
+        .or_else(|| paths.first())
+        .map(|p| asset_url(p))
 }
 
 #[derive(Clone, Copy)]
@@ -347,35 +550,24 @@ fn select_best_variant_preferring(paths: &[String], prefer: PreferFormat) -> Opt
         return Some(asset_url(candidates[0]));
     }
 
-    let mut best: Option<(usize, u8, String)> = None;
-    for path in &candidates {
-        let url = asset_url(path);
-        let penalty = format_penalty(path, prefer);
-        let Some(size) = net::fetch_content_length(&url) else {
-            continue;
-        };
-        let cand = (size, penalty, url);
-        best = Some(match best.take() {
-            None => cand,
-            Some(cur) => {
-                let cur_preferred = cur.0 <= PREFERRED_IMAGE_BYTES;
-                let new_preferred = cand.0 <= PREFERRED_IMAGE_BYTES;
-                if new_preferred && !cur_preferred {
-                    cand
-                } else if new_preferred == cur_preferred && (cand.0, cand.1) < (cur.0, cur.1) {
-                    cand
-                } else {
-                    cur
-                }
-            }
-        });
-    }
-
-    best.map(|(_, _, url)| url)
-        .or_else(|| candidates.first().map(|p| asset_url(p)))
+    let mut sorted = candidates.clone();
+    sorted.sort_by_key(|p| format_penalty(p, prefer));
+    sorted.first().map(|p| asset_url(p))
 }
 
-fn lookup_one(title_id: &str) -> Option<LookupResult> {
+fn conventional_cover_url(title_id: &str) -> String {
+    asset_url(&format!("covers/{title_id}.png"))
+}
+
+fn conventional_logo_url(title_id: &str) -> String {
+    asset_url(&format!("logos/{title_id}_logo_1_vita.png"))
+}
+
+fn conventional_hero_url(title_id: &str) -> String {
+    asset_url(&format!("heroes/{title_id}_hero_1_vita.jpg"))
+}
+
+pub fn lookup_one(title_id: &str) -> Option<LookupResult> {
     let url = format!("{}/api/games/{}", net::API_BASE, title_id);
     let bytes = net::download_to_vec(&url, MAX_JSON_BYTES).ok()?;
     let detail: GameDetail = serde_json::from_slice(&bytes).ok()?;
@@ -385,14 +577,41 @@ fn lookup_one(title_id: &str) -> Option<LookupResult> {
         .or(detail.title)
         .filter(|t| !t.trim().is_empty());
 
+    let logo_url = select_best_logo_variant(&detail.logos)
+        .or_else(|| Some(conventional_logo_url(title_id)));
+    let hero_url = select_best_variant(&detail.heroes)
+        .or_else(|| Some(conventional_hero_url(title_id)));
+    let music_url = select_best_music_variant(&detail.musics)
+        .or_else(|| Some(asset_url(&format!("music/{title_id}.mp3"))));
+
     Some(LookupResult {
         is_game: true,
         canonical_title,
         cover_url: detail.cover_path.as_deref().filter(|s| !s.trim().is_empty()).map(asset_url),
-        screenshot_url: select_best_variant(&detail.heroes),
-        logo_url: select_best_logo_variant(&detail.logos),
-        music_url: select_best_variant(&detail.musics),
+        screenshot_url: hero_url,
+        logo_url,
+        music_url,
     })
+}
+
+pub fn lookup_hero_urls(title_id: &str) -> Vec<String> {
+    let url = format!("{}/api/games/{}", net::API_BASE, title_id);
+    let Ok(bytes) = net::download_to_vec(&url, MAX_JSON_BYTES) else {
+        return Vec::new();
+    };
+    let Ok(detail) = serde_json::from_slice::<GameDetail>(&bytes) else {
+        return Vec::new();
+    };
+    detail
+        .heroes
+        .iter()
+        .filter(|p| {
+            let lower = p.to_ascii_lowercase();
+            !lower.ends_with(".webp") && !lower.ends_with(".avif")
+        })
+        .take(crate::store::MAX_SCREENSHOTS_KEPT)
+        .map(|p| asset_url(p))
+        .collect()
 }
 
 fn url_encode(s: &str) -> String {

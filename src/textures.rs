@@ -1,5 +1,6 @@
+use crate::runtime::LruCache;
 use crate::scanner::ImageBytes;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::io::Cursor;
 use std::sync::mpsc::{channel, Receiver, Sender};
 
@@ -7,40 +8,61 @@ const MAX_CACHE_BYTES: usize = 10 * 1024 * 1024;
 
 const MAX_DECODE_PENDING: usize = 6;
 
-struct Entry {
-    handle: egui::TextureHandle,
-    bytes: usize,
-    last_used: u64,
+#[derive(Clone, Copy)]
+enum TextureKind {
+    Cover,
+    Hero,
+    Logo,
+    Screenshot,
+}
+
+impl TextureKind {
+    fn from_key(key: &str) -> Self {
+        if key.ends_with(":hero") {
+            TextureKind::Hero
+        } else if key.ends_with(":logo") {
+            TextureKind::Logo
+        } else if key.ends_with(":shot") {
+            TextureKind::Screenshot
+        } else {
+            TextureKind::Cover
+        }
+    }
+
+    fn max_decoded_side(self) -> u32 {
+        match self {
+            TextureKind::Cover => 256,
+            TextureKind::Hero => 960,
+            TextureKind::Logo => 320,
+            TextureKind::Screenshot => 480,
+        }
+    }
 }
 
 pub struct TextureCache {
-    handles: HashMap<String, Entry>,
+    handles: LruCache<String, egui::TextureHandle>,
     failed: HashSet<String>,
     pending: HashSet<String>,
-    clock: u64,
-    bytes_in_use: usize,
-    decode_tx: Sender<(String, ImageBytes)>,
+    decode_tx: Sender<(String, TextureKind, ImageBytes)>,
     decode_rx: Receiver<(String, Option<egui::ColorImage>)>,
 }
 
 impl Default for TextureCache {
     fn default() -> Self {
-        let (req_tx, req_rx) = channel::<(String, ImageBytes)>();
+        let (req_tx, req_rx) = channel::<(String, TextureKind, ImageBytes)>();
         let (res_tx, res_rx) = channel::<(String, Option<egui::ColorImage>)>();
 
         std::thread::spawn(move || {
-            while let Ok((key, bytes)) = req_rx.recv() {
-                let image = decode(&bytes);
+            while let Ok((key, kind, bytes)) = req_rx.recv() {
+                let image = decode(&bytes, kind);
                 let _ = res_tx.send((key, image));
             }
         });
 
         Self {
-            handles: HashMap::new(),
+            handles: LruCache::new(MAX_CACHE_BYTES),
             failed: HashSet::new(),
             pending: HashSet::new(),
-            clock: 0,
-            bytes_in_use: 0,
             decode_tx: req_tx,
             decode_rx: res_rx,
         }
@@ -56,17 +78,7 @@ impl TextureCache {
                 Some(image) => {
                     let cost = image.size[0] * image.size[1] * 4;
                     let handle = ctx.load_texture(&key, image, egui::TextureOptions::LINEAR);
-                    self.clock += 1;
-                    self.handles.insert(
-                        key.clone(),
-                        Entry {
-                            handle,
-                            bytes: cost,
-                            last_used: self.clock,
-                        },
-                    );
-                    self.bytes_in_use += cost;
-                    self.evict_until_under_budget(&key);
+                    self.handles.insert(key, handle, cost);
                 }
                 None => {
                     self.failed.insert(key);
@@ -83,50 +95,41 @@ impl TextureCache {
     ) -> Option<egui::TextureHandle> {
         self.pump(ctx);
 
-        self.clock += 1;
-        let now = self.clock;
-
-        if let Some(entry) = self.handles.get_mut(key) {
-            entry.last_used = now;
-            return Some(entry.handle.clone());
+        if let Some(handle) = self.handles.get(key) {
+            return Some(handle.clone());
         }
         if self.failed.contains(key) {
             return None;
         }
         if !self.pending.contains(key) && self.pending.len() < MAX_DECODE_PENDING {
             self.pending.insert(key.to_string());
-            let _ = self.decode_tx.send((key.to_string(), bytes.clone()));
+            let kind = TextureKind::from_key(key);
+            let _ = self.decode_tx.send((key.to_string(), kind, bytes.clone()));
         }
         None
     }
 
-    fn evict_until_under_budget(&mut self, keep: &str) {
-        while self.bytes_in_use > MAX_CACHE_BYTES {
-            let victim = self
-                .handles
-                .iter()
-                .filter(|(k, _)| k.as_str() != keep)
-                .min_by_key(|(_, e)| e.last_used)
-                .map(|(k, _)| k.clone());
-            let Some(victim) = victim else { break };
-            if let Some(entry) = self.handles.remove(&victim) {
-                self.bytes_in_use = self.bytes_in_use.saturating_sub(entry.bytes);
-            }
-        }
+    pub fn set_pressure_fraction(&mut self, fraction: f32) {
+        let budget = ((MAX_CACHE_BYTES as f32) * fraction.clamp(0.05, 1.0)) as usize;
+        self.handles.set_max_cost_bytes(budget);
+    }
+
+    pub fn bytes_in_use(&self) -> usize {
+        self.handles.total_cost_bytes()
+    }
+
+    pub fn budget_bytes(&self) -> usize {
+        self.handles.max_cost_bytes()
     }
 
     pub fn invalidate(&mut self, key: &str) {
-        if let Some(entry) = self.handles.remove(key) {
-            self.bytes_in_use = self.bytes_in_use.saturating_sub(entry.bytes);
-        }
+        self.handles.remove(key);
         self.failed.remove(key);
         self.pending.remove(key);
     }
 }
 
-const MAX_DECODED_SIDE: u32 = 640;
-
-const MAX_SOURCE_SIDE: u32 = 1280;
+const MAX_SOURCE_SIDE: u32 = 2048;
 
 pub fn source_exceeds_decode_budget(bytes: &[u8]) -> bool {
     peek_image_dimensions(bytes)
@@ -146,7 +149,7 @@ fn peek_image_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
     reader.into_dimensions().ok()
 }
 
-fn decode((is_png, bytes): &ImageBytes) -> Option<egui::ColorImage> {
+fn decode((is_png, bytes): &ImageBytes, kind: TextureKind) -> Option<egui::ColorImage> {
     if bytes.is_empty() {
         return None;
     }
@@ -175,12 +178,9 @@ fn decode((is_png, bytes): &ImageBytes) -> Option<egui::ColorImage> {
 
     let mut image = reader.decode().ok()?;
 
-    if image.width() > MAX_DECODED_SIDE || image.height() > MAX_DECODED_SIDE {
-        image = image.resize(
-            MAX_DECODED_SIDE,
-            MAX_DECODED_SIDE,
-            image::imageops::FilterType::Triangle,
-        );
+    let max_side = kind.max_decoded_side();
+    if image.width() > max_side || image.height() > max_side {
+        image = image.resize(max_side, max_side, image::imageops::FilterType::Triangle);
     }
     let rgba = image.to_rgba8();
     let size = [rgba.width() as usize, rgba.height() as usize];

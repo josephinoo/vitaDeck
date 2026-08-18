@@ -12,16 +12,23 @@ mod vita_runtime {
 mod app;
 mod artwork;
 mod audio;
+mod bgdl;
+mod cache_manager;
 mod collections;
+mod config;
+mod ime;
 mod input;
+mod licensing;
 mod logger;
 mod mp3;
 mod net;
 mod recent;
 mod scanner;
 mod shell;
+mod store;
 mod textures;
 mod ui;
+pub mod runtime;
 
 use app::App;
 

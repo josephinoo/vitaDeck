@@ -7,7 +7,6 @@ use std::io::{Read, Seek, SeekFrom};
 #[cfg(target_os = "vita")]
 use vitasdk_sys::{sceIoDclose, sceIoDopen, sceIoDread, sceIoGetstat, SceIoDirent, SceIoStat};
 
-/// Prefer ux0, then cartridge, then secondary storage — first hit wins on TitleID dedupe.
 const APP_ROOTS: &[&str] = &["ux0:app", "gro0:app", "grw0:app", "uma0:app", "ur0:app"];
 const PSPEMU_PARTITIONS: &[&str] = &["ux0", "uma0", "ur0", "imc0"];
 const COVERS_DIR: &str = "ux0:data/VitaDeck/COVERS/";
@@ -64,27 +63,16 @@ pub struct Game {
     pub system: System,
     pub cover_bytes: Option<ImageBytes>,
     pub hero_bytes: Option<ImageBytes>,
-    /// Transparent wordmark drawn over the hero backdrop; separate from `hero_bytes` so a
-    /// title can have one without the other.
     pub logo_bytes: Option<ImageBytes>,
     pub has_box_art: bool,
     pub has_hero: bool,
     pub has_logo: bool,
-    /// Backend classification from `POST /api/v1/vitadeck/lookup`:
-    /// `None` = not yet classified (offline or lookup pending — treated as
-    /// "assume game" so nothing is hidden by a failed network call),
-    /// `Some(false)` = confirmed homebrew/tool, `Some(true)` = confirmed game.
     pub is_game: Option<bool>,
-    /// Full path to a local `music.mp3` found next to the game at scan time, if any — always
-    /// takes priority over the API's track (see `resolved_music_path`).
     pub music_path: Option<String>,
 
     pub music_resolved: bool,
-    /// `true` for a real `ux0:app` entry (native Vita title, or an Adrenaline bubble whose
-    /// BubbleID was set to the game's TitleID via ABM) — these can be launched directly with
-    /// `sceAppMgrLaunchAppByUri`. `false` for a PSP/PS1 title found only in `pspemu/` with no
-    /// matching bubble: it's listed for browsing, but launching it shows a notice instead.
     pub has_bubble: bool,
+    pub file_path: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -101,6 +89,8 @@ pub struct CachedGame {
     pub music_resolved: bool,
     #[serde(default = "default_true")]
     pub has_bubble: bool,
+    #[serde(default)]
+    pub file_path: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -131,6 +121,7 @@ pub fn load_cached_games() -> Option<Vec<Game>> {
                 music_path: c.music_path,
                 music_resolved: c.music_resolved,
                 has_bubble: c.has_bubble,
+                file_path: c.file_path,
             })
             .collect(),
     )
@@ -151,6 +142,7 @@ pub fn save_cached_games(games: &[Game]) {
             music_path: g.music_path.clone(),
             music_resolved: g.music_resolved,
             has_bubble: g.has_bubble,
+            file_path: g.file_path.clone(),
         })
         .collect();
     if let Ok(bytes) = serde_json::to_vec(&cached) {
@@ -196,17 +188,13 @@ pub fn scan_installed_games() -> (Vec<Game>, Vec<String>) {
     (games, log)
 }
 
-/// One entry from a `pspemu/PSP/GAME/<id>/EBOOT.PBP` or `pspemu/ISO/*.iso|*.cso`, keyed by
-/// its folder/file name so it can be matched against an Adrenaline bubble in `ux0:app` whose
-/// folder name (BubbleID, per Adrenaline Bubbles Manager) equals the PSP/PS1 TitleID.
 struct PspemuEntry {
     art_key: String,
     title: String,
     icon0: Option<ImageBytes>,
     system_hint: System,
-    /// Folder holding the game's own files (`music.mp3` sibling lookup); `None` for ISO/CSO
-    /// entries, which live directly under `pspemu/ISO` with no per-game folder.
     source_dir: Option<String>,
+    file_path: String,
 }
 
 struct PspemuIndex {
@@ -271,7 +259,7 @@ fn index_pspemu(log: &mut Vec<String>) -> PspemuIndex {
                 let source_dir = Some(format!("{}/{}", game_root, title_id));
 
                 has_pbp.insert(title_id.clone());
-                entries.insert(title_id, PspemuEntry { art_key, title, icon0, system_hint, source_dir });
+                entries.insert(title_id, PspemuEntry { art_key, title, icon0, system_hint, source_dir, file_path: pbp });
             }
         }
 
@@ -296,12 +284,14 @@ fn index_pspemu(log: &mut Vec<String>) -> PspemuIndex {
                     continue;
                 }
 
+                let iso_path = format!("{}/{}", iso_root, name);
                 entries.entry(stem).or_insert(PspemuEntry {
                     art_key,
                     title,
                     icon0: None,
                     system_hint: System::Psp,
                     source_dir: None,
+                    file_path: iso_path,
                 });
             }
         }
@@ -310,7 +300,6 @@ fn index_pspemu(log: &mut Vec<String>) -> PspemuIndex {
     PspemuIndex { entries, has_pbp }
 }
 
-/// Creates an empty HexFlow-compatible `overrides.dat` if missing so users can edit it.
 fn ensure_overrides_file() {
     if sce_file_exists(OVERRIDES_FILE) {
         return;
@@ -319,8 +308,6 @@ fn ensure_overrides_file() {
     let _ = std::fs::write(OVERRIDES_FILE, b"");
 }
 
-/// Reads `ux0:data/VitaDeck/overrides.dat`, HexFlow-compatible format: one `TITLEID=N` per
-/// line (`1`=Vita, `2`=PSP, `3`=PS1, `4`=homebrew), blank lines and `#` comments ignored.
 fn load_overrides() -> HashMap<String, u8> {
     let mut map = HashMap::new();
     let Some(bytes) = read_file(OVERRIDES_FILE) else { return map };
@@ -339,12 +326,6 @@ fn load_overrides() -> HashMap<String, u8> {
     map
 }
 
-/// HexFlow taxonomy with SFO-aware PSP/PS1 improvement:
-/// 1. `overrides.dat` wins
-/// 2. `PCS*` (not `PCSI*`) → Vita
-/// 3. `data/boot.bin` → Adrenaline bubble; prefer `pspemu` SFO hint, else HexFlow
-///    (`EBOOT.PBP` present → PS1, absent → PSP ISO bubble)
-/// 4. else → Vita (ports/homebrew stay launchable; utilities filtered separately)
 fn classify_app(root: &str, dir_name: &str, pspemu: &PspemuIndex, overrides: &HashMap<String, u8>) -> (System, bool) {
     if let Some(&n) = overrides.get(dir_name) {
         return match n {
@@ -364,7 +345,6 @@ fn classify_app(root: &str, dir_name: &str, pspemu: &PspemuIndex, overrides: &Ha
         if let Some((_, entry)) = find_pspemu_entry(pspemu, dir_name) {
             return (entry.system_hint, false);
         }
-        // HexFlow: boot.bin + EBOOT.PBP in GAME → PSX; boot.bin without → PSP
         if pspemu.has_pbp.contains(dir_name) {
             return (System::Psx, false);
         }
@@ -374,7 +354,6 @@ fn classify_app(root: &str, dir_name: &str, pspemu: &PspemuIndex, overrides: &Ha
     (System::Vita, false)
 }
 
-/// Resolve a pspemu entry by BubbleID/folder name, then by `art_key` / sanitized TitleID.
 fn find_pspemu_entry<'a>(pspemu: &'a PspemuIndex, bubble_id: &str) -> Option<(&'a str, &'a PspemuEntry)> {
     if let Some((key, entry)) = pspemu.entries.get_key_value(bubble_id) {
         return Some((key.as_str(), entry));
@@ -516,6 +495,7 @@ fn scan_vita_apps(
             let music_path = find_music(&dir);
             let music_resolved = music_path.is_some() || cached_music_exists(system, &art_key);
             let has_logo = cached_logo_exists(system, &art_key);
+            let file_path = pspemu_hit.map(|(_, e)| e.file_path.clone()).or_else(|| Some(dir.clone()));
             games.push(Game {
                 title_id,
                 art_key,
@@ -531,6 +511,7 @@ fn scan_vita_apps(
                 music_path,
                 music_resolved,
                 has_bubble: true,
+                file_path,
             });
         }
 
@@ -555,9 +536,6 @@ fn load_appmeta_pic0(title_id: &str) -> Option<ImageBytes> {
     None
 }
 
-/// Lists PSP/PS1 titles found in `pspemu/` that have no matching Adrenaline bubble in
-/// `ux0:app` — they can't be launched via `sceAppMgrLaunchAppByUri` yet, but are still shown
-/// so the library isn't empty while the user creates bubbles with ABM.
 fn emit_unbubbled_pspemu_games(
     games: &mut Vec<Game>,
     log: &mut Vec<String>,
@@ -576,12 +554,10 @@ fn emit_unbubbled_pspemu_games(
         let art_key = entry.art_key.clone();
         let title = entry.title.clone();
 
-        // Skip unbubbled ISO junk that isn't a Sony TitleID and has no PBP metadata.
         let looks_like_id = sanitize_sony_title_id(key).is_some()
             || sanitize_sony_title_id(&art_key).is_some();
         let has_pbp_meta = entry.source_dir.is_some();
         if !looks_like_id && !has_pbp_meta {
-            // Named ISO without a TitleID-like stem: keep only if a cover already exists.
             let cache_png = format!("{}.png", cover_cache_path(system, &art_key));
             let cache_jpg = format!("{}.jpg", cover_cache_path(system, &art_key));
             if !sce_file_exists(&cache_png) && !sce_file_exists(&cache_jpg) {
@@ -629,6 +605,7 @@ fn emit_unbubbled_pspemu_games(
             music_path,
             music_resolved,
             has_bubble: false,
+            file_path: Some(entry.file_path.clone()),
         });
     }
 }
@@ -694,10 +671,6 @@ pub fn cover_cache_path(system: System, art_key: &str) -> String {
     format!("{}{}/{}", COVERS_DIR, system.covers_folder(), art_key)
 }
 
-/// Same as `cover_cache_path` but keyed by the game's display title instead of its art key —
-/// mirrors HexFlow's dual-candidate custom cover lookup (`custom_path` by app name vs.
-/// `custom_path_id` by TitleID), so a user can drop in `ux0:data/VitaDeck/COVERS/<system>/<Game
-/// Name>.png` without knowing the TitleID.
 pub fn cover_cache_path_by_title(system: System, title: &str) -> String {
     format!("{}{}/{}", COVERS_DIR, system.covers_folder(), sanitize_cover_filename(title))
 }
@@ -775,8 +748,6 @@ pub fn load_cached_logo(system: System, art_key: &str) -> Option<ImageBytes> {
     load_texture_bytes(&logo_cache_path(system, art_key))
 }
 
-/// Disk-only cover reload, used to restore `Game::cover_bytes`.
-/// Checks COVERS_DIR first, then falls back to native Vita appmeta/sce_sys icon0.png or PBP icon0.
 pub fn load_cached_cover(system: System, art_key: &str) -> Option<ImageBytes> {
     if let Some(bytes) = load_texture_bytes(&cover_cache_path(system, art_key)) {
         return Some(bytes);
@@ -797,9 +768,6 @@ pub fn load_cached_cover(system: System, art_key: &str) -> Option<ImageBytes> {
     }
 }
 
-/// Seeds `COVERS_DIR` with cover bytes that were read from somewhere other than that cache
-/// (a Vita `sce_sys`/`appmeta` icon, a PBP `icon0`), so `load_cached_cover` can find them again
-/// without re-reading the original source or re-parsing a PBP file.
 fn persist_cover_bytes(system: System, art_key: &str, bytes: &ImageBytes) {
     let base = cover_cache_path(system, art_key);
     if let Some(parent) = std::path::Path::new(&base).parent() {
@@ -833,8 +801,6 @@ fn load_texture_bytes(base_path_no_ext: &str) -> Option<ImageBytes> {
         let path = format!("{}.{}", base_path_no_ext, ext);
         let Some(bytes) = read_file(&path) else { continue };
         if crate::textures::source_exceeds_decode_budget(&bytes) {
-            // Oversized originals (e.g. pre-vita 3840 heroes) OOM on decode — delete so the
-            // art worker can fetch a `*_vita` sibling instead of retrying forever.
             let _ = std::fs::remove_file(&path);
             continue;
         }
@@ -980,8 +946,6 @@ fn parse_sfo_title_from_file(path: &str) -> Option<String> {
 }
 
 fn parse_sfo_title(data: &[u8]) -> Option<String> {
-    // `TITLE` first: `STITLE` is the abbreviated form meant for tight spaces (e.g. "MUD"
-    // instead of the full name), which reads as cryptic here and matches the API poorly.
     let fields = parse_sfo_fields(data, &["TITLE", "STITLE"])?;
     fields
         .into_iter()

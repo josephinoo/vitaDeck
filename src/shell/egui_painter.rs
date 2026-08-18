@@ -102,12 +102,17 @@ impl SdlEguiPainter {
         canvas.set_clip_rect(None);
         for texture_id in &textures_delta.free {
             self.pending.remove(texture_id);
-            self.textures.remove(texture_id);
+            self.destroy_texture(*texture_id);
         }
         Ok(PaintStats { texture_apply_secs, geometry_secs, draw_calls, textures_uploaded, vertices_drawn })
     }
     fn is_new_creation(&self, texture_id: egui::TextureId, pos: Option<[usize; 2]>) -> bool {
         pos.is_none() || !self.textures.contains_key(&texture_id)
+    }
+    fn destroy_texture(&mut self, id: egui::TextureId) {
+        if let Some(entry) = self.textures.remove(&id) {
+            unsafe { entry.texture.destroy() };
+        }
     }
     fn flush_batch(
         &mut self,
@@ -316,6 +321,7 @@ impl SdlEguiPainter {
                 self.defer_or_give_up(texture_id, size, pos, pixels, attempts);
                 return;
             }
+            self.destroy_texture(texture_id);
             self.textures.insert(texture_id, SdlEguiTexture { texture, uv_scale: egui::vec2(1.0, 1.0) });
             return;
         }

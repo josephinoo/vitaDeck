@@ -73,19 +73,34 @@ pub fn parse_frame_header(bytes: &[u8]) -> Option<FrameInfo> {
     Some(FrameInfo { len, sample_rate, channels, version })
 }
 
+pub fn id3_tag_len(bytes: &[u8]) -> Option<u64> {
+    if bytes.len() < 10 || &bytes[0..3] != b"ID3" {
+        return None;
+    }
+    let size = ((bytes[6] as u64 & 0x7F) << 21)
+        | ((bytes[7] as u64 & 0x7F) << 14)
+        | ((bytes[8] as u64 & 0x7F) << 7)
+        | (bytes[9] as u64 & 0x7F);
+    let footer = if bytes[5] & 0x10 != 0 { 10 } else { 0 };
+    Some(10 + size + footer)
+}
+
 pub fn find_next_frame(bytes: &[u8], start: usize) -> Option<usize> {
     let mut pos = start;
 
-    if bytes.len() >= pos + 10 && &bytes[pos..pos + 3] == b"ID3" {
-        let size = ((bytes[pos + 6] as u32 & 0x7F) << 21)
-            | ((bytes[pos + 7] as u32 & 0x7F) << 14)
-            | ((bytes[pos + 8] as u32 & 0x7F) << 7)
-            | (bytes[pos + 9] as u32 & 0x7F);
-        pos += 10 + size as usize;
+    if let Some(tag_len) = id3_tag_len(&bytes[pos.min(bytes.len())..]) {
+        let skip = tag_len as usize;
+        if pos + skip >= bytes.len() {
+            return None;
+        }
+        pos += skip;
     }
     while pos + 4 <= bytes.len() {
-        if parse_frame_header(&bytes[pos..]).is_some() {
-            return Some(pos);
+        if let Some(frame) = parse_frame_header(&bytes[pos..]) {
+            let next = pos + frame.len;
+            if next + 4 > bytes.len() || parse_frame_header(&bytes[next..]).is_some() {
+                return Some(pos);
+            }
         }
         pos += 1;
     }

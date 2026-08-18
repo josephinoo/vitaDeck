@@ -1,6 +1,6 @@
 use std::path::Path;
 
-const DEFAULT_API_BASE: &str = "http://localhost:3000";
+const DEFAULT_API_BASE: &str = "https://vitadeck.josephinoo.dev";
 
 fn load_dotenv() {
     let mut api_base = DEFAULT_API_BASE.to_string();
@@ -26,11 +26,17 @@ fn load_dotenv() {
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=src/dummy.c");
+    println!("cargo:rerun-if-changed=src/c_zrif/puff.c");
+    println!("cargo:rerun-if-changed=src/c_zrif/puff.h");
+    println!("cargo:rerun-if-changed=src/c_zrif/zrif.c");
+    println!("cargo:rerun-if-changed=src/c_zrif/zrif.h");
     if Path::new(".env").exists() {
         println!("cargo:rerun-if-changed=.env");
     }
     load_dotenv();
     cc::Build::new()
         .file("src/dummy.c")
-        .compile("dummy_c");
+        .file("src/c_zrif/puff.c")
+        .file("src/c_zrif/zrif.c")
+        .compile("zrif_c");
 }

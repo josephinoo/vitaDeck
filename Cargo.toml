@@ -7,11 +7,6 @@ edition = "2021"
 anyhow = "1"
 egui = "0.31"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
-# Blocking TLS over std::net — deliberately no async runtime: tokio's I/O reactor is broken
-# on this target (its poll/epoll-shaped syscalls return EINVAL under vita-newlib/Vita3K,
-# which crashed the app under real network load), so `net.rs` speaks HTTP/1.1 by hand over
-# a synchronous rustls::ClientConnection + TcpStream. rustls itself is synchronous and works
-# fine that way; reqwest/tokio are intentionally not dependencies here.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rustls-pki-types = "1"
 sdl2 = { version = "0.38", features = ["use-pkgconfig", "unsafe_textures"] }
@@ -38,12 +33,13 @@ vitasdk-sys = { version = "0.3.3", features = [
     "SceGxm_stub",
     "SceDisplay_stub",
     "SceAvPlayer_stub",
+    "SceCommonDialog_stub",
+    "SceIme_stub",
 ] }
 
 [build-dependencies]
 cc = "1.0"
 
-# Upstream ring has no armv7-sony-vita-newlibeabihf support; this fork adds it.
 [patch.crates-io]
 ring = { git = "https://github.com/vita-rust/ring.git", branch = "v0.17.14-vita" }
 

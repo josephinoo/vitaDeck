@@ -7,17 +7,26 @@ use crate::scanner::{
     load_cached_cover, load_cached_hero, load_cached_logo, resolved_music_path, scan_installed_games, Game,
     ImageBytes, System,
 };
+use crate::store::StoreItem;
 use crate::textures::TextureCache;
-use crate::ui::{Mode, TILE_SPACING};
+use crate::ui::{card_row_stride, Mode, FOOTER_H, GRID_COLS, HEADER_H, SCREEN_H, SCREEN_W};
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc;
 
 const SCROLL_LERP: f32 = 0.22;
 
-const MAX_ART_JOBS_IN_FLIGHT: usize = 1;
+const MAX_ART_JOBS_IN_FLIGHT: usize = 3;
 
-const COVER_KEEP_RADIUS: usize = 8;
+const STORE_ART_JOBS_IN_FLIGHT: usize = 2;
+
+const PRELOAD_MAX_ART_JOBS_IN_FLIGHT: usize = 3;
+
+const COVER_KEEP_RADIUS: usize = 18;
+
+const ART_LOOKAHEAD: usize = 10;
+
+const STORE_SHOT_BUDGET: usize = 2;
 
 const SYSTEM_TABS: [(&str, Option<System>); 4] = [
     ("ALL", None),
@@ -26,6 +35,7 @@ const SYSTEM_TABS: [(&str, Option<System>); 4] = [
     ("PS1", Some(System::Psx)),
 ];
 const RECENT_TAB_INDEX: usize = SYSTEM_TABS.len();
+pub const STORE_TAB_INDEX: usize = SYSTEM_TABS.len() + 1;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ArtState {
@@ -42,8 +52,28 @@ struct KnownArt {
     music_url: Option<String>,
 }
 
+#[derive(Clone)]
+pub struct DownloadConfirmState {
+    pub title_id: String,
+    pub title: String,
+    pub selected_choice: usize,
+}
+
+pub struct StoreDetailState {
+    pub title_id: String,
+    pub screenshot_urls: Vec<String>,
+    pub screenshots: Vec<Option<ImageBytes>>,
+    pending: HashSet<usize>,
+    pub lightbox: Option<usize>,
+    pub selected_shot: usize,
+    pub hero_bytes: Option<ImageBytes>,
+    looking_up_heroes: bool,
+}
+
 pub struct App {
     pub games: Vec<Game>,
+    pub store: crate::store::StoreManager,
+    pub store_games: Vec<Game>,
     pub collections: Collections,
     pub recent: RecentlyPlayed,
     pub mode: Mode,
@@ -75,11 +105,29 @@ pub struct App {
     music_settle_frames: u32,
     pub search_query: String,
     pub search_active: bool,
-    /// (title_id, message) shown under the hero title when the selected game has no
-    /// Adrenaline bubble to launch — cleared implicitly once a different game is selected.
+    pub ime: crate::ime::ImeDialog,
     pub launch_notice: Option<(String, String)>,
     local_art_tx: mpsc::Sender<(String, Option<ImageBytes>, Option<ImageBytes>, Option<ImageBytes>)>,
     local_art_rx: mpsc::Receiver<(String, Option<ImageBytes>, Option<ImageBytes>, Option<ImageBytes>)>,
+
+    preload_pending: std::collections::HashSet<String>,
+    preload_total: usize,
+    pub store_detail: Option<StoreDetailState>,
+    shot_tx: Option<mpsc::Sender<(String, i32, String)>>,
+    shot_rx: Option<mpsc::Receiver<(String, i32, Option<ImageBytes>)>>,
+    hero_lookup_rx: Option<mpsc::Receiver<(String, Vec<String>)>>,
+    hero_lookup_tx: mpsc::Sender<(String, Vec<String>)>,
+
+    pub config: crate::config::Config,
+    pub cache_stats: crate::cache_manager::CacheStats,
+    pub settings_selected: usize,
+    tab_before_settings: usize,
+    music_requested: std::collections::HashSet<String>,
+    music_retry_after: HashMap<String, u64>,
+    frame_counter: u64,
+    pub runtime: crate::runtime::VitaRuntime,
+    pub cache_notice: Option<String>,
+    pub download_confirm: Option<DownloadConfirmState>,
 }
 
 impl App {
@@ -114,14 +162,24 @@ impl App {
         });
 
         let scan_log: Vec<String> = Vec::new();
-        let known_art: HashMap<String, KnownArt> = HashMap::new();
+        let mut known_art: HashMap<String, KnownArt> = HashMap::new();
 
-        crate::logger::log("App::new: loading collections/recent");
+        crate::logger::log("App::new: loading collections/recent/config");
         let collections = Collections::load();
         let recent = RecentlyPlayed::load();
+        let config = crate::config::Config::load();
+        crate::net::set_client_id(config.client_id.clone());
+        let cache_stats = crate::cache_manager::compute_cache_stats(&games);
+        let store = crate::store::StoreManager::new();
+        let store_games = store.to_games();
+        for item in &store.items {
+            if let Some(title_id) = &item.title_id {
+                known_art.insert(title_id.clone(), store_known_art(item));
+            }
+        }
         let tabs = build_tabs(&collections);
-        let visible = filter_games(&games, &collections, &recent, 0, "");
-        crate::logger::log("App::new: collections OK");
+        let visible = filter_games(&games, &store_games, &collections, &recent, 0, "");
+        crate::logger::log("App::new: collections and config OK");
 
         let (request_tx, done_rx) = if net_ready {
             let (request_tx, request_rx) = mpsc::channel::<ArtJob>();
@@ -138,9 +196,20 @@ impl App {
         };
 
         let (local_art_tx, local_art_rx) = mpsc::channel();
+        let (shot_tx, shot_req_rx) = mpsc::channel::<(String, i32, String)>();
+        let (shot_done_tx, shot_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            while let Ok((title_id, index, url)) = shot_req_rx.recv() {
+                let bytes = artwork::fetch_image(&url).map(|img| (img.is_png, img.bytes));
+                let _ = shot_done_tx.send((title_id, index, bytes));
+            }
+        });
+        let (hero_lookup_tx, hero_lookup_rx) = mpsc::channel();
 
         App {
             games,
+            store,
+            store_games,
             collections,
             recent,
             mode: Mode::Browse,
@@ -174,14 +243,41 @@ impl App {
             music_settle_frames: 0,
             search_query: String::new(),
             search_active: false,
+            ime: crate::ime::ImeDialog::new(),
             launch_notice: None,
             local_art_tx,
             local_art_rx,
+            preload_pending: std::collections::HashSet::new(),
+            preload_total: 0,
+            store_detail: None,
+            shot_tx: Some(shot_tx),
+            shot_rx: Some(shot_rx),
+            hero_lookup_rx: Some(hero_lookup_rx),
+            hero_lookup_tx,
+            config,
+            cache_stats,
+            settings_selected: 0,
+            tab_before_settings: 0,
+            music_requested: std::collections::HashSet::new(),
+            music_retry_after: HashMap::new(),
+            frame_counter: 0,
+            runtime: crate::runtime::VitaRuntime::new(),
+            cache_notice: None,
+            download_confirm: None,
         }
     }
 
     pub fn is_loading(&self) -> bool {
-        self.games.is_empty() && (self.scan_rx.is_some() || self.lookup_rx.is_some())
+        (self.games.is_empty() && (self.scan_rx.is_some() || self.lookup_rx.is_some()))
+            || !self.preload_pending.is_empty()
+    }
+
+    pub fn preload_progress(&self) -> Option<(usize, usize)> {
+        if self.preload_total == 0 || self.preload_pending.is_empty() {
+            None
+        } else {
+            Some((self.preload_total - self.preload_pending.len(), self.preload_total))
+        }
     }
 
     pub fn texture_cache_get(
@@ -191,6 +287,28 @@ impl App {
         bytes: &ImageBytes,
     ) -> Option<egui::TextureHandle> {
         self.texture_cache.borrow_mut().get_or_decode(ctx, key, bytes)
+    }
+
+    pub fn texture_bytes_in_use(&self) -> usize {
+        self.texture_cache.borrow().bytes_in_use()
+    }
+
+    pub fn texture_budget_bytes(&self) -> usize {
+        self.texture_cache.borrow().budget_bytes()
+    }
+
+    pub fn art_is_pending(&self, title_id: &str) -> bool {
+        matches!(self.art_state.get(title_id), Some(ArtState::Pending) | None)
+    }
+
+    pub fn store_item(&self, title_id: &str) -> Option<&StoreItem> {
+        self.store.item_by_title_id(title_id)
+    }
+
+    pub fn is_title_installed(&self, title_id: &str) -> bool {
+        self.games
+            .iter()
+            .any(|g| g.title_id == title_id && g.has_bubble)
     }
 
     pub fn clock_line(&self) -> String {
@@ -220,39 +338,67 @@ impl App {
     }
 
     fn pump_art_queue(&mut self) {
-        if !self.net_ready || self.art_jobs_in_flight >= MAX_ART_JOBS_IN_FLIGHT {
+        if !self.net_ready {
+            return;
+        }
+        let preloading = !self.preload_pending.is_empty();
+        if self.art_jobs_in_flight >= self.art_jobs_budget() {
             return;
         }
         if !net::wifi_available() {
             return;
         }
 
-        let Some(game_index) = self.next_art_candidate() else { return };
-        let Some(game) = self.games.get(game_index) else { return };
+        let game_index = if preloading { self.next_preload_candidate() } else { self.next_art_candidate() };
+        let Some(game_index) = game_index else { return };
+
+        let is_store = self.is_store_tab();
+        let target_pool = if is_store { &self.store_games } else { &self.games };
+        let Some(game) = target_pool.get(game_index) else { return };
 
         let known = self.known_art.get(&game.art_key).cloned().unwrap_or_default();
+        let known_music_url = if !self.config.download_bgm || game.music_resolved || preloading || is_store { None } else { known.music_url };
 
-        let known_music_url = if game.music_resolved { None } else { known.music_url };
-
-        if known.cover_url.is_none()
-            && known.screenshot_url.is_none()
-            && known.logo_url.is_none()
-            && known_music_url.is_none()
-        {
-            let title_id = game.title_id.clone();
-            self.art_state.insert(title_id, ArtState::Failed);
-            return;
-        }
+        let store_item = if is_store {
+            self.store.item_by_title_id(&game.title_id)
+        } else {
+            None
+        };
+        let final_cover_url = if is_store {
+            store_item.and_then(|i| i.resolved_cover_url()).or(known.cover_url)
+        } else {
+            known.cover_url.or_else(|| {
+                store_item
+                    .and_then(|i| i.cover_url.as_deref())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(crate::store::absolute_url)
+            })
+        };
+        let known_screenshot_url = if is_store {
+            store_item.and_then(|i| i.resolved_screenshot_urls().into_iter().next())
+        } else {
+            known.screenshot_url
+        };
+        let known_icon_url = if is_store {
+            store_item.and_then(|i| i.resolved_icon_url())
+        } else {
+            None
+        };
 
         let job = ArtJob {
             title_id: game.title_id.clone(),
             art_key: game.art_key.clone(),
             title: game.title.clone(),
             system: game.system,
-            known_cover_url: known.cover_url,
-            known_screenshot_url: known.screenshot_url,
-            known_logo_url: known.logo_url,
+            known_cover_url: final_cover_url,
+            known_screenshot_url,
+            known_logo_url: if is_store { None } else { known.logo_url },
+            known_icon_url,
             known_music_url,
+            store_only: is_store,
+            skip_disk: is_store,
+            music_only: false,
         };
         self.art_state.insert(job.title_id.clone(), ArtState::Pending);
         if let Some(tx) = &self.request_tx {
@@ -262,23 +408,118 @@ impl App {
         }
     }
 
-    fn next_art_candidate(&mut self) -> Option<usize> {
+    fn apply_memory_pressure(&mut self, pressure: crate::runtime::MemoryPressure) {
+        use crate::runtime::MemoryPressure::*;
+        match pressure {
+            Normal => {
+                self.texture_cache.borrow_mut().set_pressure_fraction(1.0);
+            }
+            Warning => {
+                self.texture_cache.borrow_mut().set_pressure_fraction(0.75);
+            }
+            Aggressive => {
+                self.texture_cache.borrow_mut().set_pressure_fraction(0.45);
+                self.drop_art_outside_keep_set();
+            }
+            Emergency => {
+                self.texture_cache.borrow_mut().set_pressure_fraction(0.2);
+                self.drop_art_outside_keep_set();
+                self.audio.set_music(None);
+                self.music_selected = None;
+            }
+        }
+    }
 
-        let needs_art = |game: &Game| {
-            !(game.has_box_art && game.has_hero && game.has_logo && game.music_resolved)
+    fn drop_art_outside_keep_set(&mut self) {
+        let keep = self.cover_keep_set();
+        let selected_index = self.visible.get(self.selected).copied();
+        for (index, game) in self.store_games.iter_mut().enumerate() {
+            if Some(index) != selected_index && !keep.contains(&index) {
+                game.cover_bytes = None;
+                game.hero_bytes = None;
+                game.logo_bytes = None;
+            }
+        }
+        for (index, game) in self.games.iter_mut().enumerate() {
+            if Some(index) != selected_index && !keep.contains(&index) {
+                game.cover_bytes = None;
+                game.hero_bytes = None;
+                game.logo_bytes = None;
+            }
+        }
+    }
+
+    fn art_lookahead(&self) -> usize {
+        use crate::runtime::MemoryPressure::*;
+        match self.runtime.pressure() {
+            Normal => ART_LOOKAHEAD,
+            Warning => ART_LOOKAHEAD / 2,
+            Aggressive | Emergency => 0,
+        }
+    }
+
+    fn art_jobs_budget(&self) -> usize {
+        use crate::runtime::MemoryPressure::*;
+        let base = if !self.preload_pending.is_empty() {
+            PRELOAD_MAX_ART_JOBS_IN_FLIGHT
+        } else if self.is_store_tab() {
+            STORE_ART_JOBS_IN_FLIGHT
+        } else {
+            MAX_ART_JOBS_IN_FLIGHT
         };
+        match self.runtime.pressure() {
+            Normal => base,
+            Warning => base.min(2),
+            Aggressive => 1,
+            Emergency => 0,
+        }
+    }
 
-        let near_end = (self.selected + 3).min(self.visible.len().saturating_sub(1));
-        let near_start = self.selected.saturating_sub(2);
-        if near_start > near_end {
+    fn next_preload_candidate(&mut self) -> Option<usize> {
+        for (index, game) in self.games.iter().enumerate() {
+            if self.preload_pending.contains(&game.title_id) && !self.art_state.contains_key(&game.title_id) {
+                return Some(index);
+            }
+        }
+        None
+    }
+
+    fn store_keep_slots(&self) -> (usize, usize) {
+        if self.visible.is_empty() {
+            return (0, 0);
+        }
+        let stride = card_row_stride(SCREEN_W).max(1.0);
+        let view_h = (SCREEN_H - HEADER_H - FOOTER_H).max(1.0);
+        let first_row = (self.current_scroll / stride).floor().max(0.0) as usize;
+        let rows_on_screen = ((view_h / stride).ceil() as usize).max(1);
+        let start = first_row.saturating_mul(GRID_COLS);
+        let end = start
+            .saturating_add((rows_on_screen + 1).saturating_mul(GRID_COLS))
+            .saturating_add(self.art_lookahead())
+            .min(self.visible.len());
+        (start, end)
+    }
+
+    fn next_art_candidate(&mut self) -> Option<usize> {
+        let is_store = self.is_store_tab();
+        let target_pool = if is_store { &self.store_games } else { &self.games };
+
+        if self.visible.is_empty() {
             return None;
         }
 
-        let ordered = std::iter::once(self.selected).chain(near_start..=near_end);
-        for slot in ordered {
+        let (start, end) = if is_store {
+            self.store_keep_slots()
+        } else {
+            let start = self.selected.saturating_sub(2);
+            let end = (self.selected + 4 + self.art_lookahead()).min(self.visible.len());
+            (start, end)
+        };
+
+        for slot in start..end {
             let Some(&index) = self.visible.get(slot) else { continue };
-            let Some(game) = self.games.get(index) else { continue };
-            if needs_art(game) && !self.art_state.contains_key(&game.title_id) {
+            let Some(game) = target_pool.get(index) else { continue };
+            if game.cover_bytes.is_none() && !self.art_state.contains_key(&game.title_id) {
                 return Some(index);
             }
         }
@@ -295,6 +536,7 @@ impl App {
         let selected_index = self.visible.get(self.selected).copied();
         self.visible = filter_games(
             &self.games,
+            &self.store_games,
             &self.collections,
             &self.recent,
             self.active_tab,
@@ -319,6 +561,10 @@ impl App {
                     self.games = scanned_games;
                     self.refilter_visible();
                 }
+
+                crate::cache_manager::clean_orphaned_cache(&self.games);
+                crate::cache_manager::enforce_cache_budget(&self.games, self.config.cache_budget_mb);
+                self.cache_stats = crate::cache_manager::compute_cache_stats(&self.games);
             }
         }
 
@@ -361,6 +607,23 @@ impl App {
 
                 self.art_state.clear();
 
+                if self.net_ready {
+                    let known_art = &self.known_art;
+                    self.preload_pending = self
+                        .games
+                        .iter()
+                        .filter(|g| {
+                            let Some(known) = known_art.get(&g.art_key) else { return false };
+                            (known.cover_url.is_some() && !g.has_box_art)
+                                || (known.screenshot_url.is_some() && !g.has_hero)
+                                || (known.logo_url.is_some() && !g.has_logo)
+                                || (known.music_url.is_some() && !g.music_resolved)
+                        })
+                        .map(|g| g.title_id.clone())
+                        .collect();
+                    self.preload_total = self.preload_pending.len();
+                }
+
                 if !self.is_settings() {
                     self.refilter_visible();
                 }
@@ -369,11 +632,65 @@ impl App {
     }
 
     pub fn tick(&mut self, _ctx: &egui::Context) {
+        self.frame_counter = self.frame_counter.wrapping_add(1);
+        let (pressure, changed) = self.runtime.tick();
+        if changed {
+            crate::logger::log(&format!(
+                "memory pressure -> {} ({} MB free)",
+                pressure.label(),
+                self.runtime.free_memory_bytes() / (1024 * 1024)
+            ));
+            self.apply_memory_pressure(pressure);
+        }
+
         self.apply_pending_lookup();
 
-        let target_scroll = self.selected as f32 * TILE_SPACING;
+        if let Some(res) = self.ime.poll() {
+            match res {
+                crate::ime::ImeResult::Confirmed(text) => {
+                    let trimmed = text.trim().to_string();
+                    if trimmed.is_empty() {
+                        self.search_query.clear();
+                        self.search_active = false;
+                    } else {
+                        self.search_query = trimmed;
+                        self.search_active = true;
+                    }
+                    self.refilter_visible();
+                }
+                crate::ime::ImeResult::Canceled => {
+                    if self.search_query.is_empty() {
+                        self.search_active = false;
+                    }
+                }
+            }
+        }
+
+        if self.store.tick() || (self.store_games.is_empty() && !self.store.items.is_empty()) {
+            for item in &self.store.items {
+                if let Some(title_id) = &item.title_id {
+                    self.known_art.insert(title_id.clone(), store_known_art(item));
+                }
+            }
+            self.store_games = self.store.to_games();
+            if self.is_store_tab() {
+                self.refilter_visible();
+            }
+        }
+
+        let target_scroll = if self.is_store_tab() {
+            let row_stride = card_row_stride(crate::ui::SCREEN_W);
+            let selected_row = self.selected / GRID_COLS;
+            if selected_row > 1 {
+                (selected_row - 1) as f32 * row_stride
+            } else {
+                0.0
+            }
+        } else {
+            self.selected as f32 * crate::ui::TILE_SPACING
+        };
         self.current_scroll += (target_scroll - self.current_scroll) * SCROLL_LERP;
-        if (target_scroll - self.current_scroll).abs() < 1.0 {
+        if (target_scroll - self.current_scroll).abs() < 0.5 {
             self.current_scroll = target_scroll;
         }
 
@@ -387,6 +704,9 @@ impl App {
                     cover,
                     hero,
                     logo,
+                    cover_ok,
+                    hero_ok,
+                    logo_ok,
                     music_downloaded,
                     error,
                     job_complete,
@@ -395,28 +715,60 @@ impl App {
 
                 if job_complete {
                     self.art_jobs_in_flight = self.art_jobs_in_flight.saturating_sub(1);
+                    self.preload_pending.remove(&title_id);
                 }
                 let selected_title_id =
                     self.visible.get(self.selected).and_then(|&i| self.games.get(i)).map(|g| g.title_id.clone());
 
                 if let Some(game) = self.games.iter_mut().find(|g| g.title_id == title_id) {
-                    if let Some(cover) = cover {
-                        game.cover_bytes = Some((cover.is_png, cover.bytes));
-                        game.has_box_art = true;
+                    if let Some(cover_bytes) = cover.as_ref() {
+                        game.cover_bytes = Some((cover_bytes.is_png, cover_bytes.bytes.clone()));
                         self.texture_cache.borrow_mut().invalidate(&format!("{}:{}:cover", game.system.label(), game.title_id));
+                    }
+                    if cover_ok {
+                        game.has_box_art = true;
                     }
                     if let Some(hero) = hero {
                         game.hero_bytes = Some((hero.is_png, hero.bytes));
-                        game.has_hero = true;
                         self.texture_cache.borrow_mut().invalidate(&format!("{}:{}:hero", game.system.label(), game.title_id));
+                    }
+                    if hero_ok {
+                        game.has_hero = true;
                     }
                     if let Some(logo) = logo {
                         game.logo_bytes = Some((logo.is_png, logo.bytes));
-                        game.has_logo = true;
                         self.texture_cache.borrow_mut().invalidate(&format!("{}:{}:logo", game.system.label(), game.title_id));
+                    }
+                    if logo_ok {
+                        game.has_logo = true;
                     }
                     if music_downloaded {
                         game.music_resolved = true;
+                    }
+                }
+
+                let mut store_discarded = false;
+                if let Some(index) = self.store_games.iter().position(|g| g.title_id == title_id) {
+                    let keep = self.is_store_tab() && self.cover_keep_set().contains(&index);
+                    if keep {
+                        if let Some(game) = self.store_games.get_mut(index) {
+                            if let Some(cover_bytes) = cover.as_ref() {
+                                game.cover_bytes = Some((cover_bytes.is_png, cover_bytes.bytes.clone()));
+                                self.texture_cache.borrow_mut().invalidate(&format!(
+                                    "{}:{}:cover",
+                                    game.system.label(),
+                                    game.title_id
+                                ));
+                            }
+                            if cover_ok {
+                                game.has_box_art = true;
+                            }
+                        }
+                    } else {
+                        store_discarded = true;
+                        if job_complete {
+                            self.art_state.remove(&title_id);
+                        }
                     }
                 }
 
@@ -424,23 +776,32 @@ impl App {
                     self.music_settle_frames = 0;
                 }
 
-                if job_complete {
-                    if images_ok || music_downloaded {
-                        self.dl_ok += 1;
-                        self.art_state.insert(title_id.clone(), ArtState::Done);
-                    } else if error.is_some() {
+                if music_downloaded {
+                    self.music_requested.remove(&title_id);
+                    self.music_retry_after.remove(&title_id);
+                } else if !job_complete {
+                    self.music_requested.remove(&title_id);
+                    self.music_retry_after
+                        .insert(title_id.clone(), self.frame_counter.saturating_add(8 * 60));
+                }
 
-                        self.dl_fail += 1;
-                        self.art_state.insert(title_id.clone(), ArtState::Failed);
-                        if let Some(game) = self.games.iter().find(|g| g.title_id == title_id) {
-                            if game.cover_bytes.is_none() {
-                                if let Some(reason) = &error {
-                                    self.last_error = format!("{} {}", title_id, reason);
+                if job_complete {
+                    if !store_discarded {
+                        if images_ok || music_downloaded {
+                            self.dl_ok += 1;
+                            self.art_state.insert(title_id.clone(), ArtState::Done);
+                        } else if error.is_some() {
+                            self.dl_fail += 1;
+                            self.art_state.insert(title_id.clone(), ArtState::Failed);
+                            if let Some(game) = self.games.iter().find(|g| g.title_id == title_id) {
+                                if game.cover_bytes.is_none() {
+                                    if let Some(reason) = &error {
+                                        self.last_error = format!("{} {}", title_id, reason);
+                                    }
                                 }
                             }
                         }
                     }
-
                 } else if music_downloaded {
 
                     self.art_state
@@ -528,26 +889,36 @@ impl App {
             }
         }
 
-        for index in self.cover_keep_set() {
-            if let Some(game) = self.games.get(index) {
-                if game.cover_bytes.is_none() && game.has_box_art {
-
+        if !self.is_store_tab() {
+            for index in self.cover_keep_set() {
+                if let Some(game) = self.games.get_mut(index) {
+                    if game.cover_bytes.is_none() && game.has_box_art {
+                        game.cover_bytes = load_cached_cover(game.system, &game.art_key);
+                        if game.cover_bytes.is_none() {
+                            game.has_box_art = false;
+                        }
+                    }
                 }
             }
-        }
-
-        for index in self.cover_keep_set() {
-            if let Some(game) = self.games.get_mut(index) {
-                if game.cover_bytes.is_none() && game.has_box_art {
-                    game.cover_bytes = load_cached_cover(game.system, &game.art_key);
-                    if game.cover_bytes.is_none() {
-                        game.has_box_art = false;
+        } else {
+            for index in self.cover_keep_set() {
+                let Some(game) = self.store_games.get(index) else { continue };
+                if game.cover_bytes.is_some() || !self.is_title_installed(&game.title_id) {
+                    continue;
+                }
+                let (system, art_key, title_id) = (game.system, game.art_key.clone(), game.title_id.clone());
+                let local = load_cached_cover(system, &art_key)
+                    .or_else(|| crate::scanner::load_vita_cover(&title_id).0);
+                if let Some(bytes) = local {
+                    if let Some(game) = self.store_games.get_mut(index) {
+                        game.cover_bytes = Some(bytes);
                     }
                 }
             }
         }
 
         self.release_offscreen_art(selected_index);
+        self.pump_store_media();
         self.pump_music(selected_index);
     }
 
@@ -556,7 +927,7 @@ impl App {
     const ART_SETTLE_FRAMES: u32 = 2;
 
     fn pump_music(&mut self, selected_index: Option<usize>) {
-        if self.is_settings() || selected_index.is_none() {
+        if self.is_settings() || self.is_store_tab() || selected_index.is_none() {
             self.audio.set_music(None);
             self.music_selected = None;
             self.music_settle_frames = 0;
@@ -566,12 +937,67 @@ impl App {
         if self.music_settle_frames < Self::MUSIC_SETTLE_FRAMES {
             return;
         }
-        let path = selected_index.and_then(|i| self.games.get(i)).and_then(resolved_music_path);
-        self.audio.set_music(path.as_deref());
+
+        let Some(index) = selected_index else { return };
+        let Some(game) = self.games.get(index) else { return };
+
+        if let Some(path) = resolved_music_path(game) {
+            self.audio.set_music(Some(path.as_str()));
+            return;
+        }
+
+        self.audio.set_music(None);
+        self.request_music_download(index);
+    }
+
+    fn request_music_download(&mut self, index: usize) {
+        if !self.config.download_bgm || !self.net_ready || !net::wifi_available() {
+            return;
+        }
+        let Some(game) = self.games.get(index) else { return };
+        if self
+            .music_retry_after
+            .get(&game.title_id)
+            .is_some_and(|&retry_at| self.frame_counter < retry_at)
+        {
+            return;
+        }
+        if self.music_requested.contains(&game.title_id) {
+            return;
+        }
+        let job = ArtJob {
+            title_id: game.title_id.clone(),
+            art_key: game.art_key.clone(),
+            title: game.title.clone(),
+            system: game.system,
+            known_cover_url: None,
+            known_screenshot_url: None,
+            known_logo_url: None,
+            known_icon_url: None,
+            known_music_url: self.known_art.get(&game.art_key).and_then(|k| k.music_url.clone()),
+            store_only: false,
+            skip_disk: false,
+            music_only: true,
+        };
+        let title_id = job.title_id.clone();
+        if let Some(tx) = &self.request_tx {
+            if tx.send(job).is_ok() {
+                self.music_requested.insert(title_id);
+            }
+        }
     }
 
     fn cover_keep_set(&self) -> std::collections::HashSet<usize> {
         let mut keep = std::collections::HashSet::new();
+        if self.is_store_tab() {
+            let (start, end) = self.store_keep_slots();
+            for slot in start..end {
+                if let Some(&index) = self.visible.get(slot) {
+                    keep.insert(index);
+                }
+            }
+            return keep;
+        }
         let end = (self.selected + COVER_KEEP_RADIUS).min(self.visible.len().saturating_sub(1));
         let start = self.selected.saturating_sub(COVER_KEEP_RADIUS);
         if start <= end {
@@ -584,8 +1010,35 @@ impl App {
         keep
     }
 
+    fn drop_store_cover(&mut self, index: usize) {
+        let Some(game) = self.store_games.get_mut(index) else { return };
+        game.cover_bytes = None;
+        game.hero_bytes = None;
+        let title_id = game.title_id.clone();
+        if !matches!(self.art_state.get(&title_id), Some(ArtState::Pending)) {
+            self.art_state.remove(&title_id);
+        }
+    }
+
     fn release_offscreen_art(&mut self, selected_index: Option<usize>) {
         let cover_keep = self.cover_keep_set();
+        if self.is_store_tab() {
+            let drop: Vec<usize> = self
+                .store_games
+                .iter()
+                .enumerate()
+                .filter(|(index, game)| {
+                    Some(*index) != selected_index
+                        && (game.cover_bytes.is_some() || game.hero_bytes.is_some())
+                        && !cover_keep.contains(index)
+                })
+                .map(|(index, _)| index)
+                .collect();
+            for index in drop {
+                self.drop_store_cover(index);
+            }
+            return;
+        }
         for (index, game) in self.games.iter_mut().enumerate() {
             if Some(index) == selected_index {
                 continue;
@@ -614,6 +1067,18 @@ impl App {
                 self.audio.play(SoundEffect::TabSwitch);
                 self.change_tab(1);
             }
+            AppCommand::OpenSettings => {
+                let settings_index = self.settings_tab_index();
+                if self.active_tab == settings_index {
+                    self.audio.play(SoundEffect::CloseModal);
+                    self.set_tab(self.tab_before_settings);
+                } else {
+                    self.audio.play(SoundEffect::TabSwitch);
+                    self.tab_before_settings = self.active_tab;
+                    self.settings_selected = 0;
+                    self.set_tab(settings_index);
+                }
+            }
             AppCommand::SelectTab(index) => {
                 if index != self.active_tab {
                     self.audio.play(SoundEffect::TabSwitch);
@@ -621,7 +1086,10 @@ impl App {
                 self.set_tab(index);
             }
             AppCommand::OpenCollectionPicker => {
-                if !self.visible.is_empty() {
+                if self.mode == Mode::StoreDetail {
+                    self.audio.play(SoundEffect::OpenModal);
+                    self.toggle_store_lightbox();
+                } else if !self.visible.is_empty() {
                     self.audio.play(SoundEffect::OpenModal);
                     self.mode = Mode::CollectionPicker;
                     self.picker_index = 0;
@@ -632,19 +1100,66 @@ impl App {
                 self.remove_selected_from_collection();
             }
             AppCommand::ToggleSearch => {
-                self.audio.play(SoundEffect::OpenModal);
-                self.search_active = !self.search_active;
-                if !self.search_active {
-                    self.search_query.clear();
+                if !self.is_store_tab() {
+                    return;
                 }
-                self.refilter_visible();
+                if self.search_active && !self.search_query.is_empty() {
+                    self.audio.play(SoundEffect::Confirm);
+                    self.search_query.clear();
+                    self.search_active = false;
+                    self.refilter_visible();
+                } else {
+                    self.audio.play(SoundEffect::OpenModal);
+                    let title = if self.is_store_tab() {
+                        "Search the store"
+                    } else {
+                        "Search games"
+                    };
+                    self.ime.open(title, &self.search_query, 64);
+                    self.search_active = true;
+                }
+            }
+            AppCommand::SetDownloadChoice(choice) => {
+                if let Some(confirm) = &mut self.download_confirm {
+                    confirm.selected_choice = choice;
+                    self.audio.play(SoundEffect::Navigate);
+                }
+            }
+            AppCommand::ConfirmDownload(yes) => {
+                if let Some(confirm) = self.download_confirm.take() {
+                    if yes {
+                        self.execute_download(&confirm.title_id);
+                    } else {
+                        self.audio.play(SoundEffect::CloseModal);
+                    }
+                }
             }
             AppCommand::Confirm => {
+                if let Some(confirm) = self.download_confirm.take() {
+                    if confirm.selected_choice == 0 {
+                        self.execute_download(&confirm.title_id);
+                    } else {
+                        self.audio.play(SoundEffect::CloseModal);
+                    }
+                    return;
+                }
                 self.audio.play(SoundEffect::Confirm);
                 if self.is_settings() {
-                    self.trigger_rescan();
+                    match self.settings_selected {
+                        0 => self.trigger_rescan(),
+                        1 => self.handle_command(AppCommand::ToggleDownloadBgm),
+                        2 => self.handle_command(AppCommand::CycleCacheBudget),
+                        3 => self.handle_command(AppCommand::CleanOrphanCache),
+                        4 => self.handle_command(AppCommand::PurgeMusicCache),
+                        5 => self.handle_command(AppCommand::PurgeAllCache),
+                        _ => {}
+                    }
                 } else if self.mode == Mode::CollectionPicker {
                     self.toggle_picker_row(self.picker_index);
+                } else if self.mode == Mode::StoreDetail {
+                    self.confirm_store_detail();
+                } else if self.is_store_tab() {
+                    self.open_store_detail();
                 } else {
                     self.launch_selected();
                 }
@@ -653,12 +1168,100 @@ impl App {
                 self.audio.play(SoundEffect::Confirm);
                 self.trigger_rescan();
             }
+            AppCommand::ToggleDownloadBgm => {
+                self.audio.play(SoundEffect::Confirm);
+                self.config.download_bgm = !self.config.download_bgm;
+                self.config.save();
+                if self.config.download_bgm {
+                    self.music_requested.clear();
+                    self.music_retry_after.clear();
+                } else {
+                    self.audio.set_music(None);
+                    self.music_selected = None;
+                }
+                self.cache_notice = Some(format!(
+                    "Background music: {}",
+                    if self.config.download_bgm { "Enabled" } else { "Disabled" }
+                ));
+            }
+            AppCommand::CycleCacheBudget => {
+                self.audio.play(SoundEffect::Confirm);
+                self.config.next_budget_option();
+                let freed = crate::cache_manager::enforce_cache_budget(&self.games, self.config.cache_budget_mb);
+                self.cache_stats = crate::cache_manager::compute_cache_stats(&self.games);
+                self.cache_notice = Some(format!(
+                    "Cache limit: {} ({} freed)",
+                    self.config.budget_label(),
+                    crate::cache_manager::format_bytes(freed)
+                ));
+            }
+            AppCommand::CleanOrphanCache => {
+                self.audio.play(SoundEffect::Confirm);
+                let (count, freed) = crate::cache_manager::clean_orphaned_cache(&self.games);
+                self.cache_stats = crate::cache_manager::compute_cache_stats(&self.games);
+                self.cache_notice = Some(format!(
+                    "Orphans removed: {} files ({})",
+                    count,
+                    crate::cache_manager::format_bytes(freed)
+                ));
+            }
+            AppCommand::PurgeMusicCache => {
+                self.audio.play(SoundEffect::Confirm);
+                let (count, freed) = crate::cache_manager::purge_music();
+                self.cache_stats = crate::cache_manager::compute_cache_stats(&self.games);
+                for g in &mut self.games {
+                    g.music_resolved = false;
+                }
+                self.music_requested.clear();
+                self.music_retry_after.clear();
+                self.audio.set_music(None);
+                self.cache_notice = Some(format!(
+                    "Music purged: {} files ({})",
+                    count,
+                    crate::cache_manager::format_bytes(freed)
+                ));
+            }
+            AppCommand::PurgeAllCache => {
+                self.audio.play(SoundEffect::Confirm);
+                let (count, freed) = crate::cache_manager::purge_all_cache();
+                self.cache_stats = crate::cache_manager::compute_cache_stats(&self.games);
+                self.art_state.clear();
+                for g in &mut self.games {
+                    g.cover_bytes = None;
+                    g.hero_bytes = None;
+                    g.logo_bytes = None;
+                    g.music_resolved = false;
+                }
+                self.music_requested.clear();
+                self.music_retry_after.clear();
+                self.audio.set_music(None);
+                self.cache_notice = Some(format!(
+                    "All cache purged: {} files ({})",
+                    count,
+                    crate::cache_manager::format_bytes(freed)
+                ));
+            }
             AppCommand::TogglePickerRow(index) => {
                 self.audio.play(SoundEffect::Confirm);
                 self.toggle_picker_row(index);
             }
             AppCommand::Back => {
-                if self.search_active {
+                if self.download_confirm.is_some() {
+                    self.audio.play(SoundEffect::CloseModal);
+                    self.download_confirm = None;
+                    return;
+                }
+                if self.mode == Mode::StoreDetail {
+                    if self.store_detail.as_ref().and_then(|d| d.lightbox).is_some() {
+                        self.audio.play(SoundEffect::CloseModal);
+                        if let Some(detail) = &mut self.store_detail {
+                            detail.lightbox = None;
+                        }
+                    } else {
+                        self.audio.play(SoundEffect::CloseModal);
+                        self.close_store_detail();
+                    }
+                } else if self.search_active {
                     self.audio.play(SoundEffect::CloseModal);
                     self.search_active = false;
                     self.search_query.clear();
@@ -667,6 +1270,9 @@ impl App {
                     self.audio.play(SoundEffect::CloseModal);
                     self.mode = Mode::Browse;
                     self.tabs = build_tabs(&self.collections);
+                } else if self.is_settings() {
+                    self.audio.play(SoundEffect::CloseModal);
+                    self.set_tab(self.tab_before_settings);
                 }
             }
             AppCommand::SelectVisibleSlot(slot) => {
@@ -678,7 +1284,11 @@ impl App {
                 }
             }
             AppCommand::Quit => {
-                if self.mode == Mode::Browse {
+                if self.download_confirm.is_some() {
+                    self.download_confirm = None;
+                } else if self.mode == Mode::StoreDetail {
+                    self.close_store_detail();
+                } else if self.mode == Mode::Browse {
                     std::process::exit(0);
                 }
             }
@@ -687,6 +1297,24 @@ impl App {
 
     fn handle_input(&mut self, input: InputCommand) {
         use crate::audio::SoundEffect;
+        if let Some(confirm) = &mut self.download_confirm {
+            match input {
+                InputCommand::MoveLeft => {
+                    if confirm.selected_choice > 0 {
+                        confirm.selected_choice = 0;
+                        self.audio.play(SoundEffect::Navigate);
+                    }
+                }
+                InputCommand::MoveRight => {
+                    if confirm.selected_choice < 1 {
+                        confirm.selected_choice = 1;
+                        self.audio.play(SoundEffect::Navigate);
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
         match self.mode {
             Mode::Browse => match input {
                 InputCommand::MoveLeft => {
@@ -702,15 +1330,29 @@ impl App {
                     }
                 }
                 InputCommand::MoveUp => {
-                    if self.selected > 0 {
-                        self.selected = self.selected.saturating_sub(5);
-                        self.audio.play(SoundEffect::Navigate);
+                    if self.is_settings() {
+                        if self.settings_selected > 0 {
+                            self.settings_selected -= 1;
+                            self.audio.play(SoundEffect::Navigate);
+                        }
+                    } else if self.is_store_tab() {
+                        if self.selected > 0 {
+                            self.selected = self.selected.saturating_sub(GRID_COLS);
+                            self.audio.play(SoundEffect::Navigate);
+                        }
                     }
                 }
                 InputCommand::MoveDown => {
-                    if self.selected + 1 < self.visible.len() {
-                        self.selected = (self.selected + 5).min(self.visible.len().saturating_sub(1));
-                        self.audio.play(SoundEffect::Navigate);
+                    if self.is_settings() {
+                        if self.settings_selected < 5 {
+                            self.settings_selected += 1;
+                            self.audio.play(SoundEffect::Navigate);
+                        }
+                    } else if self.is_store_tab() {
+                        if self.selected + 1 < self.visible.len() {
+                            self.selected = (self.selected + GRID_COLS).min(self.visible.len().saturating_sub(1));
+                            self.audio.play(SoundEffect::Navigate);
+                        }
                     }
                 }
             },
@@ -732,7 +1374,76 @@ impl App {
                     InputCommand::MoveLeft | InputCommand::MoveRight => {}
                 }
             }
+            Mode::StoreDetail => {
+                let n = self.store_detail.as_ref().map(|d| d.screenshot_urls.len()).unwrap_or(0);
+                if n == 0 {
+                    return;
+                }
+                match input {
+                    InputCommand::MoveLeft => {
+                        if let Some(detail) = &mut self.store_detail {
+                            if let Some(idx) = detail.lightbox {
+                                if idx > 0 {
+                                    detail.lightbox = Some(idx - 1);
+                                    detail.selected_shot = idx - 1;
+                                    self.audio.play(SoundEffect::Navigate);
+                                }
+                            } else if detail.selected_shot > 0 {
+                                detail.selected_shot -= 1;
+                                self.audio.play(SoundEffect::Navigate);
+                            }
+                        }
+                    }
+                    InputCommand::MoveRight => {
+                        if let Some(detail) = &mut self.store_detail {
+                            if let Some(idx) = detail.lightbox {
+                                if idx + 1 < n {
+                                    detail.lightbox = Some(idx + 1);
+                                    detail.selected_shot = idx + 1;
+                                    self.audio.play(SoundEffect::Navigate);
+                                }
+                            } else if detail.selected_shot + 1 < n {
+                                detail.selected_shot += 1;
+                                self.audio.play(SoundEffect::Navigate);
+                            }
+                        }
+                    }
+                    InputCommand::MoveUp | InputCommand::MoveDown => {}
+                }
+            }
         }
+    }
+
+    pub fn tab_count(&self, tab: usize) -> usize {
+        if tab == RECENT_TAB_INDEX {
+            self.recent
+                .order()
+                .iter()
+                .filter(|title_id| self.games.iter().any(|g| &g.title_id == *title_id))
+                .count()
+        } else if tab == STORE_TAB_INDEX {
+            self.store_games.len()
+        } else {
+            match collection_index_of_tab(tab) {
+                Some(collection_idx) => self
+                    .games
+                    .iter()
+                    .filter(|g| self.collections.contains(collection_idx, &g.title_id))
+                    .count(),
+                None => {
+                    let system = SYSTEM_TABS.get(tab).and_then(|(_, s)| *s);
+                    self.games
+                        .iter()
+                        .filter(|g| g.is_game != Some(false))
+                        .filter(|g| system.map_or(true, |s| g.system == s))
+                        .count()
+                }
+            }
+        }
+    }
+
+    pub fn is_store_tab(&self) -> bool {
+        self.active_tab == STORE_TAB_INDEX
     }
 
     pub fn settings_tab_index(&self) -> usize {
@@ -747,8 +1458,12 @@ impl App {
         if self.mode != Mode::Browse {
             return;
         }
-        let total = self.settings_tab_index() as i32 + 1;
-        let next = (self.active_tab as i32 + delta).rem_euclid(total);
+        let total = self.settings_tab_index() as i32;
+        if total <= 0 {
+            return;
+        }
+        let current = self.active_tab.min(self.settings_tab_index() - 1) as i32;
+        let next = (current + delta).rem_euclid(total);
         self.set_tab(next as usize);
     }
 
@@ -756,38 +1471,387 @@ impl App {
         if index > self.settings_tab_index() || self.mode != Mode::Browse {
             return;
         }
+        let leaving_store = self.is_store_tab() && index != STORE_TAB_INDEX;
         self.active_tab = index;
         self.selected = 0;
         self.current_scroll = 0.0;
+        if leaving_store {
+            let drop: Vec<usize> = self
+                .store_games
+                .iter()
+                .enumerate()
+                .filter(|(_, game)| game.cover_bytes.is_some() || game.hero_bytes.is_some())
+                .map(|(i, _)| i)
+                .collect();
+            for i in drop {
+                self.drop_store_cover(i);
+            }
+        }
         self.refilter_visible();
     }
 
-    fn launch_selected(&mut self) {
-        let Some(game) = self.visible.get(self.selected).and_then(|&i| self.games.get(i)) else { return };
+    fn open_store_detail(&mut self) {
+        let Some(game) = self
+            .visible
+            .get(self.selected)
+            .and_then(|&i| self.store_games.get(i))
+        else {
+            return;
+        };
+        let title_id = game.title_id.clone();
+        let item = self.store.item_by_title_id(&title_id);
+        let urls = item.map(|i| i.resolved_screenshot_urls()).unwrap_or_default();
+        let hero_url = item
+            .and_then(|i| i.resolved_background_url())
+            .or_else(|| urls.first().cloned());
+        let looking_up = urls.is_empty();
+        let n = urls.len();
+        self.store_detail = Some(StoreDetailState {
+            title_id: title_id.clone(),
+            screenshot_urls: urls,
+            screenshots: vec![None; n],
+            pending: HashSet::new(),
+            lightbox: None,
+            selected_shot: 0,
+            hero_bytes: None,
+            looking_up_heroes: looking_up,
+        });
+        self.mode = Mode::StoreDetail;
+        if let Some(url) = hero_url {
+            if let Some(tx) = &self.shot_tx {
+                let _ = tx.send((title_id.clone(), -1, url));
+            }
+        }
+        if looking_up {
+            let tx = self.hero_lookup_tx.clone();
+            std::thread::spawn(move || {
+                let urls = artwork::lookup_hero_urls(&title_id);
+                let _ = tx.send((title_id, urls));
+            });
+        }
+    }
 
-        if !game.has_bubble {
-            self.launch_notice = Some((
-                game.title_id.clone(),
-                format!("Crea una burbuja con ABM (BubbleID = {}) para poder lanzar este juego", game.title_id),
-            ));
+    fn close_store_detail(&mut self) {
+        if let Some(detail) = self.store_detail.take() {
+            let mut cache = self.texture_cache.borrow_mut();
+            cache.invalidate(&format!("PS Vita:{}:hero", detail.title_id));
+            for i in 0..detail.screenshot_urls.len() {
+                cache.invalidate(&format!("PS Vita:{}:shot{i}", detail.title_id));
+            }
+        }
+        self.mode = Mode::Browse;
+    }
+
+    fn toggle_store_lightbox(&mut self) {
+        let Some(detail) = &mut self.store_detail else { return };
+        if detail.screenshot_urls.is_empty() {
             return;
         }
-        self.launch_notice = None;
+        if detail.lightbox.is_some() {
+            detail.lightbox = None;
+        } else {
+            let idx = detail.selected_shot.min(detail.screenshot_urls.len().saturating_sub(1));
+            detail.lightbox = Some(idx);
+        }
+    }
 
+    fn confirm_store_detail(&mut self) {
+        let Some(title_id) = self.store_detail.as_ref().map(|d| d.title_id.clone()) else {
+            return;
+        };
+        if self.is_title_installed(&title_id) {
+            self.launch_selected();
+            return;
+        }
+        let title = self
+            .store
+            .item_by_title_id(&title_id)
+            .map(|i| i.name.clone())
+            .unwrap_or_else(|| title_id.clone());
+
+        self.audio.play(crate::audio::SoundEffect::OpenModal);
+        self.download_confirm = Some(DownloadConfirmState {
+            title_id,
+            title,
+            selected_choice: 0,
+        });
+    }
+
+    pub fn execute_download(&mut self, title_id: &str) {
+        let title = self
+            .store
+            .item_by_title_id(title_id)
+            .map(|i| i.name.clone())
+            .unwrap_or_else(|| title_id.to_string());
+        match self.store.download_and_install(title_id) {
+            Ok(()) => {
+                self.audio.play(crate::audio::SoundEffect::LaunchGame);
+                self.launch_notice = Some((
+                    title_id.to_string(),
+                    format!("Enqueued download for '{title}'. Added to LiveArea downloads!"),
+                ));
+            }
+            Err(e) => {
+                self.audio.play(crate::audio::SoundEffect::CloseModal);
+                self.launch_notice = Some((title_id.to_string(), format!("Download error: {e}")));
+            }
+        }
+    }
+
+    fn pump_store_media(&mut self) {
+        if let Some(rx) = &self.hero_lookup_rx {
+            if let Ok((title_id, urls)) = rx.try_recv() {
+                if let Some(detail) = &mut self.store_detail {
+                    if detail.title_id == title_id && detail.looking_up_heroes {
+                        detail.looking_up_heroes = false;
+                        if !urls.is_empty() {
+                            let n = urls.len();
+                            detail.screenshot_urls = urls;
+                            detail.screenshots = vec![None; n];
+                            detail.pending.clear();
+                            if detail.hero_bytes.is_none() {
+                                if let Some(url) = detail.screenshot_urls.first().cloned() {
+                                    if let Some(tx) = &self.shot_tx {
+                                        let _ = tx.send((title_id, -1, url));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(rx) = &self.shot_rx {
+            while let Ok((title_id, index, bytes)) = rx.try_recv() {
+                let Some(detail) = &mut self.store_detail else { continue };
+                if detail.title_id != title_id {
+                    continue;
+                }
+                if index < 0 {
+                    if let Some(bytes) = bytes {
+                        detail.hero_bytes = Some(bytes);
+                    }
+                } else {
+                    let i = index as usize;
+                    detail.pending.remove(&i);
+                    if i < detail.screenshots.len() {
+                        detail.screenshots[i] = bytes;
+                    }
+                }
+            }
+        }
+
+        if self.mode != Mode::StoreDetail {
+            return;
+        }
+        let (title_id, n, focus, in_flight) = {
+            let Some(detail) = &self.store_detail else { return };
+            if detail.screenshot_urls.is_empty() {
+                return;
+            }
+            let n = detail.screenshot_urls.len();
+            (
+                detail.title_id.clone(),
+                n,
+                detail.lightbox.unwrap_or(detail.selected_shot).min(n.saturating_sub(1)),
+                detail.pending.len(),
+            )
+        };
+        if in_flight >= STORE_SHOT_BUDGET {
+            return;
+        }
+        let mut order = Vec::with_capacity(n);
+        order.push(focus);
+        if focus > 0 {
+            order.push(focus - 1);
+        }
+        if focus + 1 < n {
+            order.push(focus + 1);
+        }
+        for i in 0..n {
+            if !order.contains(&i) {
+                order.push(i);
+            }
+        }
+        let mut budget = STORE_SHOT_BUDGET - in_flight;
+        for i in order {
+            if budget == 0 {
+                break;
+            }
+            let Some(detail) = &mut self.store_detail else { break };
+            if detail.screenshots.get(i).and_then(|s| s.as_ref()).is_some() {
+                continue;
+            }
+            if detail.pending.contains(&i) {
+                continue;
+            }
+            let Some(url) = detail.screenshot_urls.get(i).cloned() else { continue };
+            if let Some(tx) = &self.shot_tx {
+                if tx.send((title_id.clone(), i as i32, url)).is_ok() {
+                    detail.pending.insert(i);
+                    budget -= 1;
+                }
+            }
+        }
+    }
+}
+
+fn booter_exists(title_id: &str) -> bool {
+    for part in &["ux0", "ur0", "uma0", "imc0"] {
+        let app_path = format!("{}:app/{}", part, title_id);
+        let sfo_path = format!("{}:app/{}/sce_sys/param.sfo", part, title_id);
+        let eboot_path = format!("{}:app/{}/eboot.bin", part, title_id);
+        if std::path::Path::new(&app_path).exists()
+            || std::path::Path::new(&sfo_path).exists()
+            || std::path::Path::new(&eboot_path).exists()
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn find_adrenaline_booters() -> Vec<&'static str> {
+    let mut found = Vec::new();
+    for title_id in &["PSPEMUCFW", "PSPEMU001", "ADRLAUNCH", "RETROLNCR"] {
+        if booter_exists(title_id) {
+            found.push(*title_id);
+        }
+    }
+    found
+}
+
+fn to_ms0_path(game_file_path: &str) -> Option<String> {
+    let normalized = game_file_path.replace('\\', "/");
+    if let Some((_, rest)) = normalized.split_once(":pspemu/") {
+        return Some(format!("ms0:/{}", rest));
+    }
+    if let Some(idx) = normalized.find("pspemu/") {
+        return Some(format!("ms0:/{}", &normalized[idx + 7..]));
+    }
+    None
+}
+
+fn prepare_adrenaline_boot(game_file_path: &str, booter_id: &str) -> Result<String, String> {
+    if !std::path::Path::new(game_file_path).exists() {
+        return Err(format!("game path not found: {}", game_file_path));
+    }
+    let Some(ms0_path) = to_ms0_path(game_file_path) else {
+        return Err(format!("invalid PSP path for Adrenaline: {}", game_file_path));
+    };
+
+    let bubblesdb_dir = "ux0:adrbblbooter/bubblesdb";
+    std::fs::create_dir_all(bubblesdb_dir)
+        .map_err(|e| format!("failed create bubblesdb dir: {}", e))?;
+    let bubblesdb_file = format!("{}/{}.txt", bubblesdb_dir, booter_id);
+    std::fs::write(&bubblesdb_file, &ms0_path)
+        .map_err(|e| format!("failed write bubblesdb: {}", e))?;
+
+    let app_data_dir = format!("ux0:app/{}/data", booter_id);
+    std::fs::create_dir_all(&app_data_dir)
+        .map_err(|e| format!("failed create app data dir: {}", e))?;
+    let boot_inf_file = format!("{}/boot.inf", app_data_dir);
+    let boot_inf_content = format!("PATH={}\nDRIVER=INFERNO\nEXECUTE=EBOOT.BIN\n", ms0_path);
+    std::fs::write(&boot_inf_file, boot_inf_content)
+        .map_err(|e| format!("failed write boot.inf: {}", e))?;
+
+    let boot_bin_file = format!("{}/boot.bin", app_data_dir);
+    std::fs::write(&boot_bin_file, ms0_path.as_bytes())
+        .map_err(|e| format!("failed write boot.bin: {}", e))?;
+
+    if !std::path::Path::new(&boot_inf_file).exists() || !std::path::Path::new(&boot_bin_file).exists() {
+        return Err("boot payload missing after write".to_string());
+    }
+
+    Ok(ms0_path)
+}
+
+impl App {
+    fn launch_selected(&mut self) {
+        let current_game = if self.is_store_tab() {
+            self.visible.get(self.selected).and_then(|&i| self.store_games.get(i))
+        } else {
+            self.visible.get(self.selected).and_then(|&i| self.games.get(i))
+        };
+        let Some(game) = current_game else { return };
+
+        let mut launch_candidates = vec![game.title_id.clone()];
+
+        if game.system != System::Vita {
+            if !game.has_bubble {
+                let Some(file_path) = game.file_path.clone() else {
+                    self.launch_notice = Some((
+                        game.title_id.clone(),
+                        "No se encontró la ruta local del juego PSP/PS1".to_string(),
+                    ));
+                    return;
+                };
+                let mut errors = Vec::new();
+                launch_candidates.clear();
+                for booter_id in find_adrenaline_booters() {
+                    match prepare_adrenaline_boot(&file_path, booter_id) {
+                        Ok(ms0_path) => {
+                            crate::logger::log(&format!(
+                                "launch_selected: using booter {} for {} -> {}",
+                                booter_id, game.title_id, ms0_path
+                            ));
+                            launch_candidates.push(booter_id.to_string());
+                        }
+                        Err(e) => {
+                            errors.push(format!("{}: {}", booter_id, e));
+                        }
+                    }
+                }
+                if launch_candidates.is_empty() {
+                    crate::logger::log(&format!(
+                        "launch_selected: no valid adrenaline booter for {} ({})",
+                        game.title_id,
+                        errors.join(" | ")
+                    ));
+                    self.launch_notice = Some((
+                        game.title_id.clone(),
+                        "No se pudo preparar el launcher de Adrenaline (revisa PSPEMUCFW/PSPEMU001)".to_string(),
+                    ));
+                    return;
+                }
+            }
+        }
+
+        self.launch_notice = None;
         self.recent.touch(&game.title_id);
+        crate::logger::log(&format!(
+            "launch_selected: {} (candidates: {})",
+            game.title_id,
+            launch_candidates.join(",")
+        ));
+        self.audio.play(crate::audio::SoundEffect::LaunchGame);
         self.audio.set_music(None);
         self.music_selected = None;
         self.music_settle_frames = 0;
 
         #[cfg(target_os = "vita")]
         {
-            let uri = format!("psgm:play?titleid={}", game.title_id);
-            if let Ok(c_uri) = std::ffi::CString::new(uri) {
-                unsafe {
-                    vitasdk_sys::sceAppMgrLaunchAppByUri(0, c_uri.as_ptr());
+            for target_title_id in &launch_candidates {
+                let uri = format!("psgm:play?titleid={}", target_title_id);
+                if let Ok(c_uri) = std::ffi::CString::new(uri) {
+                    std::thread::sleep(std::time::Duration::from_millis(150));
+                    unsafe {
+                        let rc = vitasdk_sys::sceAppMgrLaunchAppByUri(0x20000, c_uri.as_ptr());
+                        if rc >= 0 {
+                            vitasdk_sys::sceKernelExitProcess(0);
+                        }
+                        crate::logger::log(&format!(
+                            "launch_selected: sceAppMgrLaunchAppByUri failed target={} rc=0x{:08X}",
+                            target_title_id, rc as u32
+                        ));
+                    }
                 }
-                std::process::exit(0);
             }
+            self.launch_notice = Some((
+                game.title_id.clone(),
+                "No se pudo lanzar el juego (falló AppMgr en todos los launchers)".to_string(),
+            ));
         }
 
         if self.active_tab == RECENT_TAB_INDEX {
@@ -844,20 +1908,22 @@ fn build_tabs(collections: &Collections) -> Vec<String> {
         .iter()
         .map(|(name, _)| name.to_string())
         .chain(std::iter::once("RECENTLY PLAYED".to_string()))
+        .chain(std::iter::once("STORE".to_string()))
         .chain(collections.items.iter().map(|c| c.name.to_uppercase()))
         .collect()
 }
 
 fn collection_index_of_tab(tab: usize) -> Option<usize> {
-    if tab <= RECENT_TAB_INDEX {
+    if tab <= STORE_TAB_INDEX {
         None
     } else {
-        Some(tab - RECENT_TAB_INDEX - 1)
+        Some(tab - STORE_TAB_INDEX - 1)
     }
 }
 
 fn filter_games(
     games: &[Game],
+    store_games: &[Game],
     collections: &Collections,
     recent: &RecentlyPlayed,
     tab: usize,
@@ -869,6 +1935,8 @@ fn filter_games(
             .iter()
             .filter_map(|title_id| games.iter().position(|g| &g.title_id == title_id))
             .collect()
+    } else if tab == STORE_TAB_INDEX {
+        (0..store_games.len()).collect()
     } else {
         match collection_index_of_tab(tab) {
             Some(collection_idx) => games
@@ -882,7 +1950,6 @@ fn filter_games(
                 games
                     .iter()
                     .enumerate()
-
                     .filter(|(_, g)| g.is_game != Some(false))
                     .filter(|(_, g)| system.map_or(true, |s| g.system == s))
                     .map(|(i, _)| i)
@@ -891,17 +1958,48 @@ fn filter_games(
         }
     };
 
+    if tab != STORE_TAB_INDEX {
+        return raw;
+    }
+
+    let target_list = store_games;
     let query = search.trim().to_lowercase();
     if query.is_empty() {
         raw
     } else {
         raw.into_iter()
-            .filter(|&i| {
-                let g = &games[i];
-                g.title.to_lowercase().contains(&query)
-                    || g.title_id.to_lowercase().contains(&query)
-                    || g.art_key.to_lowercase().contains(&query)
-            })
+            .filter(|&i| target_list.get(i).is_some_and(|g| contains_ignore_case(&g.title, &query)))
             .collect()
+    }
+}
+
+fn contains_ignore_case(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    if haystack.len() < needle.len() {
+        return false;
+    }
+    let hay = haystack.as_bytes();
+    let ned = needle.as_bytes();
+    if haystack.is_ascii() && needle.is_ascii() {
+        return hay
+            .windows(ned.len())
+            .any(|w| w.eq_ignore_ascii_case(ned));
+    }
+    haystack.to_lowercase().contains(needle)
+}
+
+fn store_known_art(item: &StoreItem) -> KnownArt {
+    KnownArt {
+        cover_url: item
+            .cover_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(crate::store::absolute_url),
+        screenshot_url: item.resolved_screenshot_urls().into_iter().next(),
+        logo_url: None,
+        music_url: None,
     }
 }

@@ -21,10 +21,18 @@ pub enum AppCommand {
     RemoveFromCollection,
     ToggleSearch,
     Rescan,
+    ToggleDownloadBgm,
+    CycleCacheBudget,
+    CleanOrphanCache,
+    PurgeMusicCache,
+    PurgeAllCache,
     Quit,
+    OpenSettings,
     SelectVisibleSlot(usize),
     SelectTab(usize),
     TogglePickerRow(usize),
+    SetDownloadChoice(usize),
+    ConfirmDownload(bool),
 }
 
 impl From<InputCommand> for AppCommand {
@@ -45,7 +53,7 @@ pub fn map_controller_button_event(event: &Event) -> Option<AppCommand> {
         Button::Y => AppCommand::OpenCollectionPicker,
         Button::X => AppCommand::RemoveFromCollection,
         Button::Back => AppCommand::ToggleSearch,
-        Button::Start => AppCommand::Quit,
+        Button::Start => AppCommand::OpenSettings,
         Button::LeftShoulder => AppCommand::TabPrev,
         Button::RightShoulder => AppCommand::TabNext,
 
