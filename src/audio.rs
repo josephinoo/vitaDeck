@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Read;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+use std::sync::{Arc, Condvar, Mutex};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SoundEffect {
@@ -71,7 +73,11 @@ impl WavSound {
             .collect();
 
         if self.sample_rate == SFX_SAMPLE_RATE {
-            return WavSound { sample_rate: SFX_SAMPLE_RATE, channels: 1, samples: mono };
+            return WavSound {
+                sample_rate: SFX_SAMPLE_RATE,
+                channels: 1,
+                samples: mono,
+            };
         }
 
         let ratio = SFX_SAMPLE_RATE as f64 / self.sample_rate as f64;
@@ -85,20 +91,26 @@ impl WavSound {
             let b = mono.get(idx + 1).copied().unwrap_or(a as i16) as f64;
             resampled.push((a + (b - a) * frac) as i16);
         }
-        WavSound { sample_rate: SFX_SAMPLE_RATE, channels: 1, samples: resampled }
+        WavSound {
+            sample_rate: SFX_SAMPLE_RATE,
+            channels: 1,
+            samples: resampled,
+        }
     }
 }
 
-enum MusicCmd {
+const SFX_SAMPLE_RATE: u32 = 48000;
+const SFX_GRAIN_SIZE: usize = 512;
+
+#[derive(Debug)]
+pub enum MusicCmd {
     Play(String),
     Stop,
 }
 
 pub struct AudioEngine {
     tx: mpsc::Sender<SoundEffect>,
-
     music_tx: mpsc::Sender<MusicCmd>,
-
     music_path: Option<String>,
 }
 
@@ -130,7 +142,7 @@ impl AudioEngine {
         });
 
         let (music_tx, music_rx) = mpsc::channel::<MusicCmd>();
-        std::thread::spawn(move || music_thread_main(music_rx));
+        start_music_subsystem(music_rx);
 
         AudioEngine {
             tx,
@@ -172,11 +184,8 @@ fn load_sound(map: &mut HashMap<SoundEffect, WavSound>, effect: SoundEffect, fil
             }
         }
     }
-    crate::scanner::write_append_log(&format!("audio: failed to load sound {filename}"));
+    crate::logger::log(&format!("audio: failed to load sound {filename}"));
 }
-
-const SFX_SAMPLE_RATE: u32 = 48000;
-const SFX_GRAIN_SIZE: usize = 512;
 
 #[cfg(target_os = "vita")]
 fn open_sfx_port() -> i32 {
@@ -189,7 +198,7 @@ fn open_sfx_port() -> i32 {
             SCE_AUDIO_OUT_MODE_MONO as u32,
         );
         if port < 0 {
-            crate::scanner::write_append_log(&format!("audio: sceAudioOutOpenPort failed ({port})"));
+            crate::logger::log(&format!("audio: sceAudioOutOpenPort (SFX) failed (0x{:08X})", port as u32));
         }
         port
     }
@@ -211,7 +220,7 @@ fn play_sound_on_hardware(port: i32, sound: &WavSound) {
             if chunk.len() == SFX_GRAIN_SIZE {
                 sceAudioOutOutput(port, chunk.as_ptr() as *const _);
             } else {
-                let mut padded = vec![0i16; SFX_GRAIN_SIZE];
+                let mut padded = [0i16; SFX_GRAIN_SIZE];
                 padded[..chunk.len()].copy_from_slice(chunk);
                 sceAudioOutOutput(port, padded.as_ptr() as *const _);
             }
@@ -220,12 +229,101 @@ fn play_sound_on_hardware(port: i32, sound: &WavSound) {
 }
 
 #[cfg(not(target_os = "vita"))]
-fn play_sound_on_hardware(_port: i32, _sound: &WavSound) {
+fn play_sound_on_hardware(_port: i32, _sound: &WavSound) {}
 
+pub struct PcmRingBuffer {
+    buffer: Vec<i16>,
+    capacity: usize,
+    read_pos: usize,
+    write_pos: usize,
+    count: usize,
 }
 
-const MUSIC_READ_CHUNK: usize = 32 * 1024;
-const MUSIC_WINDOW_TARGET: usize = 96 * 1024;
+impl PcmRingBuffer {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            buffer: vec![0i16; capacity],
+            capacity,
+            read_pos: 0,
+            write_pos: 0,
+            count: 0,
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.read_pos = 0;
+        self.write_pos = 0;
+        self.count = 0;
+    }
+
+    pub fn available_write(&self) -> usize {
+        self.capacity - self.count
+    }
+
+    pub fn available_read(&self) -> usize {
+        self.count
+    }
+
+    pub fn write_samples(&mut self, samples: &[i16]) -> usize {
+        let to_write = samples.len().min(self.capacity - self.count);
+        if to_write == 0 {
+            return 0;
+        }
+
+        let first_chunk = to_write.min(self.capacity - self.write_pos);
+        self.buffer[self.write_pos..self.write_pos + first_chunk].copy_from_slice(&samples[..first_chunk]);
+
+        let second_chunk = to_write - first_chunk;
+        if second_chunk > 0 {
+            self.buffer[..second_chunk].copy_from_slice(&samples[first_chunk..to_write]);
+        }
+
+        self.write_pos = (self.write_pos + to_write) % self.capacity;
+        self.count += to_write;
+        to_write
+    }
+
+    pub fn read_samples(&mut self, out: &mut [i16]) -> usize {
+        let to_read = out.len().min(self.count);
+        if to_read == 0 {
+            return 0;
+        }
+
+        let first_chunk = to_read.min(self.capacity - self.read_pos);
+        out[..first_chunk].copy_from_slice(&self.buffer[self.read_pos..self.read_pos + first_chunk]);
+
+        let second_chunk = to_read - first_chunk;
+        if second_chunk > 0 {
+            out[first_chunk..to_read].copy_from_slice(&self.buffer[..second_chunk]);
+        }
+
+        self.read_pos = (self.read_pos + to_read) % self.capacity;
+        self.count -= to_read;
+        to_read
+    }
+}
+
+pub struct SharedAudioQueue {
+    pub ring: Mutex<PcmRingBuffer>,
+    pub cond_read: Condvar,
+    pub cond_write: Condvar,
+    pub playing: AtomicBool,
+    pub flush_requested: AtomicBool,
+    pub sample_rate: std::sync::atomic::AtomicU32,
+}
+
+impl SharedAudioQueue {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            ring: Mutex::new(PcmRingBuffer::new(capacity)),
+            cond_read: Condvar::new(),
+            cond_write: Condvar::new(),
+            playing: AtomicBool::new(false),
+            flush_requested: AtomicBool::new(false),
+            sample_rate: std::sync::atomic::AtomicU32::new(44100),
+        }
+    }
+}
 
 struct AlignedBuf<T> {
     storage: Vec<T>,
@@ -251,10 +349,6 @@ impl<T: Copy + Default> AlignedBuf<T> {
         unsafe { self.storage.as_mut_ptr().add(self.offset) }
     }
 
-    fn as_ptr(&self) -> *const T {
-        unsafe { self.storage.as_ptr().add(self.offset) }
-    }
-
     fn as_mut_slice(&mut self) -> &mut [T] {
         &mut self.storage[self.offset..self.offset + self.len]
     }
@@ -275,22 +369,170 @@ fn skip_id3_tag(file: &mut File) {
     let _ = file.seek(SeekFrom::Start(start));
 }
 
-enum TrackOutcome {
-    PlayNext(String),
-    Idle,
-    LoopSame,
+const BGM_OUT_SAMPLES_PER_CH: usize = 1024;
+const BGM_OUT_CHANNELS: usize = 2;
+const BGM_OUT_CHUNK_SAMPLES: usize = BGM_OUT_SAMPLES_PER_CH * BGM_OUT_CHANNELS;
+const PCM_RING_CAPACITY_SAMPLES: usize = 65536;
+const MUSIC_READ_CHUNK: usize = 16 * 1024;
+const MUSIC_WINDOW_TARGET: usize = 64 * 1024;
+
+#[cfg(target_os = "vita")]
+fn start_music_subsystem(music_rx: mpsc::Receiver<MusicCmd>) {
+    let queue = Arc::new(SharedAudioQueue::new(PCM_RING_CAPACITY_SAMPLES));
+    let playback_queue = Arc::clone(&queue);
+
+    std::thread::spawn(move || {
+        audio_output_thread_main(playback_queue);
+    });
+
+    std::thread::spawn(move || {
+        audio_decoder_thread_main(music_rx, queue);
+    });
+}
+
+#[cfg(not(target_os = "vita"))]
+fn start_music_subsystem(music_rx: mpsc::Receiver<MusicCmd>) {
+    std::thread::spawn(move || {
+        while music_rx.recv().is_ok() {}
+    });
 }
 
 #[cfg(target_os = "vita")]
-fn music_thread_main(rx: mpsc::Receiver<MusicCmd>) {
+fn audio_output_thread_main(queue: Arc<SharedAudioQueue>) {
+    use vitasdk_sys::*;
+
+    crate::logger::log("audio: audio output thread started");
+
+    let mut current_sample_rate: u32 = 44100;
+    let mut port: i32 = -1;
+
+    let mut out_buffer = [0i16; BGM_OUT_CHUNK_SAMPLES];
+    let mut logged_underrun = false;
+
+    loop {
+        if queue.flush_requested.swap(false, Ordering::SeqCst) {
+            if let Ok(mut ring) = queue.ring.lock() {
+                ring.clear();
+                queue.cond_write.notify_all();
+            }
+        }
+
+        let is_playing = queue.playing.load(Ordering::SeqCst);
+        let requested_sample_rate = queue.sample_rate.load(Ordering::SeqCst);
+
+        if is_playing && port >= 0 && requested_sample_rate > 0 && requested_sample_rate != current_sample_rate {
+            unsafe { sceAudioOutReleasePort(port) };
+            port = -1;
+            crate::logger::log(&format!(
+                "audio: sample rate changed from {}Hz to {}Hz, recreating port",
+                current_sample_rate, requested_sample_rate
+            ));
+            current_sample_rate = requested_sample_rate;
+        } else if requested_sample_rate > 0 {
+            current_sample_rate = requested_sample_rate;
+        }
+
+        if !is_playing {
+            if port >= 0 {
+                unsafe { sceAudioOutReleasePort(port) };
+                port = -1;
+                crate::logger::log("audio: audio port closed (stopped)");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            continue;
+        }
+
+        if port < 0 {
+            unsafe {
+                port = sceAudioOutOpenPort(
+                    SCE_AUDIO_OUT_PORT_TYPE_BGM,
+                    BGM_OUT_SAMPLES_PER_CH as i32,
+                    current_sample_rate as i32,
+                    SCE_AUDIO_OUT_MODE_STEREO as u32,
+                );
+                if port < 0 {
+                    crate::logger::log(&format!(
+                        "audio: sceAudioOutOpenPort(BGM, {}Hz) failed: 0x{:08X}; trying MAIN fallback",
+                        current_sample_rate, port as u32
+                    ));
+                    port = sceAudioOutOpenPort(
+                        SCE_AUDIO_OUT_PORT_TYPE_MAIN,
+                        BGM_OUT_SAMPLES_PER_CH as i32,
+                        current_sample_rate as i32,
+                        SCE_AUDIO_OUT_MODE_STEREO as u32,
+                    );
+                }
+                if port >= 0 {
+                    let mut vol = [SCE_AUDIO_OUT_MAX_VOL as i32; 2];
+                    sceAudioOutSetVolume(
+                        port,
+                        SCE_AUDIO_VOLUME_FLAG_L_CH | SCE_AUDIO_VOLUME_FLAG_R_CH,
+                        vol.as_mut_ptr(),
+                    );
+                    crate::logger::log(&format!(
+                        "audio: audio port opened successfully (port={}, freq={}Hz, len={})",
+                        port, current_sample_rate, BGM_OUT_SAMPLES_PER_CH
+                    ));
+                } else {
+                    crate::logger::log(&format!(
+                        "audio: fatal - failed to open any audio port: 0x{:08X}",
+                        port as u32
+                    ));
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    continue;
+                }
+            }
+        }
+
+        let read_count = if let Ok(mut ring) = queue.ring.lock() {
+            let count = ring.read_samples(&mut out_buffer);
+            if count < BGM_OUT_CHUNK_SAMPLES {
+                out_buffer[count..].fill(0);
+                if is_playing && !logged_underrun && count == 0 {
+                    crate::logger::log(&format!(
+                        "audio: buffer underrun (avail={})",
+                        ring.available_read()
+                    ));
+                    logged_underrun = true;
+                }
+            } else {
+                logged_underrun = false;
+            }
+            if ring.available_write() >= (BGM_OUT_CHUNK_SAMPLES * 2) {
+                queue.cond_write.notify_all();
+            }
+            count
+        } else {
+            0
+        };
+        let _ = read_count;
+
+        if port >= 0 {
+            unsafe {
+                let out_rc = sceAudioOutOutput(port, out_buffer.as_ptr() as *const _);
+                if out_rc < 0 {
+                    crate::logger::log(&format!(
+                        "audio: sceAudioOutOutput failed: 0x{:08X}",
+                        out_rc as u32
+                    ));
+                }
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "vita")]
+fn audio_decoder_thread_main(rx: mpsc::Receiver<MusicCmd>, queue: Arc<SharedAudioQueue>) {
     use std::mem::size_of;
     use vitasdk_sys::*;
+
+    crate::logger::log("audio: audio decoder thread started");
 
     unsafe {
         let load = sceSysmoduleLoadModule(SCE_SYSMODULE_AUDIOCODEC);
         if load < 0 {
-            crate::scanner::write_append_log(&format!(
-                "audio: sceSysmoduleLoadModule(AUDIOCODEC) failed: 0x{:08X}",
+            crate::logger::log(&format!(
+                "audio: sceSysmoduleLoadModule(AUDIOCODEC) returned 0x{:08X}",
                 load as u32
             ));
         }
@@ -298,121 +540,113 @@ fn music_thread_main(rx: mpsc::Receiver<MusicCmd>) {
         let mut init_param: SceAudiodecInitParam = std::mem::zeroed();
         init_param.mp3 = SceAudiodecInitStreamParam {
             size: size_of::<SceAudiodecInitStreamParam>() as u32,
-            totalStreams: 1,
+            totalStreams: SCE_AUDIODEC_MP3_MAX_STREAMS,
         };
         let init_rc = sceAudiodecInitLibrary(SCE_AUDIODEC_TYPE_MP3, &mut init_param);
         if init_rc < 0 && (init_rc as u32) != 0x807F0003 {
-            crate::scanner::write_append_log(&format!(
-                "audio: sceAudiodecInitLibrary failed: 0x{:08X} (fatal, no music this session)",
+            crate::logger::log(&format!(
+                "audio: sceAudiodecInitLibrary failed: 0x{:08X} (fatal)",
                 init_rc as u32
             ));
             while rx.recv().is_ok() {}
             return;
         } else if (init_rc as u32) == 0x807F0003 {
-            crate::scanner::write_append_log(
-                "audio: sceAudiodecInitLibrary returned ALREADY_INITIALIZED; continuing with existing state",
-            );
+            crate::logger::log("audio: sceAudiodecInitLibrary returned ALREADY_INITIALIZED (0x807F0003)");
+        } else {
+            crate::logger::log("audio: sceAudiodecInitLibrary initialized successfully");
         }
 
         let align = SCE_AUDIODEC_ALIGNMENT_SIZE as usize;
         let mut es_buf = AlignedBuf::<u8>::new(SCE_AUDIODEC_MP3_MAX_ES_SIZE as usize, align);
         let pcm_len = (SCE_AUDIODEC_MP3_MAX_SAMPLES * SCE_AUDIODEC_MP3_MAX_CH_IN_DECODER) as usize;
         let mut pcm_buf = AlignedBuf::<i16>::new(pcm_len, align);
-        let mut info: SceAudiodecInfo = std::mem::zeroed();
-        info.mp3.size = size_of::<SceAudiodecInfoMp3>() as u32;
-        info.mp3.ch = 2;
-        info.mp3.version = SCE_AUDIODEC_MP3_MPEG_VERSION_1 as u32;
+        let mut current_track: Option<String> = None;
+        let mut stereo_converter = vec![0i16; pcm_len * 2];
 
-        let mut ctrl: SceAudiodecCtrl = std::mem::zeroed();
-        ctrl.size = size_of::<SceAudiodecCtrl>() as u32;
-        ctrl.wordLength = SCE_AUDIODEC_WORD_LENGTH_16BITS;
-        ctrl.pEs = es_buf.as_mut_ptr();
-        ctrl.maxEsSize = es_buf.len as u32;
-        ctrl.pPcm = pcm_buf.as_mut_ptr() as *mut _;
-        ctrl.maxPcmSize = (pcm_buf.len * 2) as u32;
-        ctrl.pInfo = &mut info;
-
-        let create_rc = sceAudiodecCreateDecoder(&mut ctrl, SCE_AUDIODEC_TYPE_MP3);
-        if create_rc < 0 {
-            crate::scanner::write_append_log(&format!(
-                "audio: sceAudiodecCreateDecoder failed: 0x{:08X} (fatal, no music this session)",
-                create_rc as u32
-            ));
-            sceAudiodecTermLibrary(SCE_AUDIODEC_TYPE_MP3);
-            while rx.recv().is_ok() {}
-            return;
-        }
-
-        let mut current: Option<String> = None;
         loop {
-            let path = match current.take() {
+            let path = match current_track.take() {
                 Some(p) => p,
                 None => match rx.recv() {
                     Ok(MusicCmd::Play(p)) => p,
-                    Ok(MusicCmd::Stop) | Err(_) => continue,
+                    Ok(MusicCmd::Stop) => {
+                        queue.playing.store(false, Ordering::SeqCst);
+                        queue.flush_requested.store(true, Ordering::SeqCst);
+                        continue;
+                    }
+                    Err(_) => break,
                 },
             };
 
-            match decode_track(&path, &rx, &mut ctrl, &mut es_buf, &mut pcm_buf, align) {
-                TrackOutcome::PlayNext(p) => current = Some(p),
-                TrackOutcome::Idle => current = None,
-                TrackOutcome::LoopSame => current = Some(path),
+            crate::logger::log(&format!("audio: requested track: {}", path));
+            queue.flush_requested.store(true, Ordering::SeqCst);
+            queue.playing.store(true, Ordering::SeqCst);
+
+            let outcome = decode_and_feed_mp3(
+                &path,
+                &rx,
+                &queue,
+                &mut es_buf,
+                &mut pcm_buf,
+                &mut stereo_converter,
+            );
+
+            match outcome {
+                DecodeOutcome::PlayNext(next) => {
+                    current_track = Some(next);
+                }
+                DecodeOutcome::LoopSame => {
+                    current_track = Some(path);
+                }
+                DecodeOutcome::Stopped => {
+                    queue.playing.store(false, Ordering::SeqCst);
+                    current_track = None;
+                }
             }
         }
+
+        sceAudiodecTermLibrary(SCE_AUDIODEC_TYPE_MP3);
     }
 }
 
+enum DecodeOutcome {
+    PlayNext(String),
+    LoopSame,
+    Stopped,
+}
+
 #[cfg(target_os = "vita")]
-fn decode_track(
+fn decode_and_feed_mp3(
     path: &str,
     rx: &mpsc::Receiver<MusicCmd>,
-    ctrl: &mut vitasdk_sys::SceAudiodecCtrl,
+    queue: &Arc<SharedAudioQueue>,
     es_buf: &mut AlignedBuf<u8>,
     pcm_buf: &mut AlignedBuf<i16>,
-    align: usize,
-) -> TrackOutcome {
+    stereo_converter: &mut [i16],
+) -> DecodeOutcome {
     use std::mem::size_of;
     use vitasdk_sys::*;
 
-    fn check_interrupt(rx: &mpsc::Receiver<MusicCmd>) -> Option<TrackOutcome> {
-        match rx.try_recv() {
-            Ok(MusicCmd::Play(p)) => Some(TrackOutcome::PlayNext(p)),
-            Ok(MusicCmd::Stop) => Some(TrackOutcome::Idle),
-            Err(_) => None,
-        }
-    }
-
     let Ok(mut file) = File::open(path) else {
-        crate::scanner::write_append_log(&format!("audio: failed to open {}", path));
-        return TrackOutcome::Idle;
+        crate::logger::log(&format!("audio: failed to open file: {}", path));
+        return DecodeOutcome::Stopped;
     };
-    unsafe { skip_id3_tag(&mut file) };
+    skip_id3_tag(&mut file);
 
-    unsafe {
-        let clear_rc = sceAudiodecClearContext(ctrl);
-        if clear_rc < 0 {
-            crate::scanner::write_append_log(&format!(
-                "audio: sceAudiodecClearContext failed: 0x{:08X} path={} (continuing anyway)",
-                clear_rc as u32, path
-            ));
-        }
-    }
-
-    let mut window: Vec<u8> = Vec::new();
-    let mut read_buf = vec![0u8; MUSIC_READ_CHUNK];
+    let mut window: Vec<u8> = Vec::with_capacity(MUSIC_WINDOW_TARGET + MUSIC_READ_CHUNK);
+    let mut read_buf = [0u8; MUSIC_READ_CHUNK];
     let mut eof = false;
-    let mut pcm_accumulator: AlignedBuf<i16> = AlignedBuf::new(8192, align);
-    let mut accum_len: usize = 0;
-    let mut port: i32 = -1;
-    let mut logged_decode_fail = false;
     let mut produced_audio = false;
+    let mut logged_header = false;
+    let mut ctrl: Option<(SceAudiodecCtrl, SceAudiodecInfo)> = None;
+    let mut decoder_created = false;
 
-    const GRAIN_SIZE: usize = 1024;
-
-    let outcome = 'decode: loop {
-        if let Some(outcome) = check_interrupt(rx) {
-            break 'decode outcome;
+    let outcome = 'stream: loop {
+        match rx.try_recv() {
+            Ok(MusicCmd::Play(next)) => break 'stream DecodeOutcome::PlayNext(next),
+            Ok(MusicCmd::Stop) => break 'stream DecodeOutcome::Stopped,
+            Err(_) => {}
         }
+
         if !eof && window.len() < MUSIC_WINDOW_TARGET {
             match file.read(&mut read_buf) {
                 Ok(0) => eof = true,
@@ -423,7 +657,11 @@ fn decode_track(
 
         let Some(offset) = crate::mp3::find_next_frame(&window, 0) else {
             if eof {
-                break 'decode if produced_audio { TrackOutcome::LoopSame } else { TrackOutcome::Idle };
+                break 'stream if produced_audio {
+                    DecodeOutcome::LoopSame
+                } else {
+                    DecodeOutcome::Stopped
+                };
             }
             if window.len() > 16 {
                 let keep = 16.min(window.len());
@@ -431,13 +669,55 @@ fn decode_track(
             }
             continue;
         };
+
         let Some(frame) = crate::mp3::parse_frame_header(&window[offset..]) else {
             window.drain(0..offset + 1);
             continue;
         };
+
+        if !logged_header {
+            queue.sample_rate.store(frame.sample_rate, Ordering::SeqCst);
+            crate::logger::log(&format!(
+                "audio: MP3 header parsed - rate={}Hz ch={} ver={} frame_len={} path={}",
+                frame.sample_rate, frame.channels, frame.version, frame.len, path
+            ));
+            logged_header = true;
+        }
+
+        if !decoder_created {
+            let mut info: SceAudiodecInfo = unsafe { std::mem::zeroed() };
+            info.mp3.size = size_of::<SceAudiodecInfoMp3>() as u32;
+            info.mp3.ch = frame.channels;
+            info.mp3.version = frame.version;
+
+            let mut c: SceAudiodecCtrl = unsafe { std::mem::zeroed() };
+            c.size = size_of::<SceAudiodecCtrl>() as u32;
+            c.wordLength = SCE_AUDIODEC_WORD_LENGTH_16BITS;
+            c.pEs = es_buf.as_mut_ptr();
+            c.maxEsSize = es_buf.len as u32;
+            c.pPcm = pcm_buf.as_mut_ptr() as *mut _;
+            c.maxPcmSize = (pcm_buf.len * 2) as u32;
+            c.pInfo = &mut info;
+
+            let create_rc = unsafe { sceAudiodecCreateDecoder(&mut c, SCE_AUDIODEC_TYPE_MP3) };
+            if create_rc < 0 {
+                crate::logger::log(&format!(
+                    "audio: sceAudiodecCreateDecoder failed: 0x{:08X} for {} (ch={}, ver={})",
+                    create_rc as u32, path, frame.channels, frame.version
+                ));
+                break 'stream DecodeOutcome::Stopped;
+            }
+            ctrl = Some((c, info));
+            decoder_created = true;
+        }
+
         if window.len() < offset + frame.len {
             if eof {
-                break 'decode if produced_audio { TrackOutcome::LoopSame } else { TrackOutcome::Idle };
+                break 'stream if produced_audio {
+                    DecodeOutcome::LoopSame
+                } else {
+                    DecodeOutcome::Stopped
+                };
             }
             match file.read(&mut read_buf) {
                 Ok(0) => eof = true,
@@ -448,99 +728,79 @@ fn decode_track(
         }
 
         let frame_bytes = &window[offset..offset + frame.len];
-        unsafe {
-            es_buf.as_mut_slice()[..frame_bytes.len()].copy_from_slice(frame_bytes);
+        if let Some((c, info)) = ctrl.as_mut() {
+            unsafe {
+                es_buf.as_mut_slice()[..frame_bytes.len()].copy_from_slice(frame_bytes);
 
-            let mut info: SceAudiodecInfo = std::mem::zeroed();
-            info.mp3.size = size_of::<SceAudiodecInfoMp3>() as u32;
-            info.mp3.ch = frame.channels;
-            info.mp3.version = frame.version;
-            ctrl.pEs = es_buf.as_mut_ptr();
-            ctrl.inputEsSize = frame.len as u32;
-            ctrl.maxEsSize = es_buf.len as u32;
-            ctrl.pPcm = pcm_buf.as_mut_ptr() as *mut _;
-            ctrl.maxPcmSize = (pcm_buf.len * 2) as u32;
-            ctrl.pInfo = &mut info;
+                info.mp3.size = size_of::<SceAudiodecInfoMp3>() as u32;
+                info.mp3.ch = frame.channels;
+                info.mp3.version = frame.version;
 
-            let decode_rc = sceAudiodecDecode(ctrl);
-            if decode_rc >= 0 && ctrl.outputPcmSize > 0 {
-                let total_samples = (ctrl.outputPcmSize / 2) as usize;
-                let channels = info.mp3.ch.max(1) as usize;
-                let pcm_slice = &pcm_buf.as_slice()[..total_samples];
+                c.pEs = es_buf.as_mut_ptr();
+                c.inputEsSize = frame.len as u32;
+                c.maxEsSize = es_buf.len as u32;
+                c.pPcm = pcm_buf.as_mut_ptr() as *mut _;
+                c.maxPcmSize = (pcm_buf.len * 2) as u32;
+                c.pInfo = info as *mut SceAudiodecInfo;
 
-                if accum_len + total_samples > pcm_accumulator.len {
-                    let mut bigger = AlignedBuf::<i16>::new(accum_len + total_samples + 4096, align);
-                    bigger.as_mut_slice()[..accum_len].copy_from_slice(&pcm_accumulator.as_slice()[..accum_len]);
-                    pcm_accumulator = bigger;
-                }
-                pcm_accumulator.as_mut_slice()[accum_len..accum_len + total_samples].copy_from_slice(pcm_slice);
-                accum_len += total_samples;
-                produced_audio = true;
+                let decode_rc = sceAudiodecDecode(c);
+                if decode_rc >= 0 && c.outputPcmSize > 0 {
+                    let sample_count = (c.outputPcmSize / 2) as usize;
+                    let raw_samples = &pcm_buf.as_slice()[..sample_count];
 
-                if port < 0 {
-                    let mode = if channels == 1 { SCE_AUDIO_OUT_MODE_MONO } else { SCE_AUDIO_OUT_MODE_STEREO };
-                    port = sceAudioOutOpenPort(SCE_AUDIO_OUT_PORT_TYPE_BGM, GRAIN_SIZE as i32, frame.sample_rate as i32, mode as u32);
-                    if port < 0 {
-                        crate::scanner::write_append_log(&format!(
-                            "audio: sceAudioOutOpenPort(BGM) failed: 0x{:08X} path={} (trying MAIN fallback)",
-                            port as u32, path
-                        ));
-                        port = sceAudioOutOpenPort(
-                            SCE_AUDIO_OUT_PORT_TYPE_MAIN,
-                            GRAIN_SIZE as i32,
-                            frame.sample_rate as i32,
-                            mode as u32,
-                        );
-                        if port < 0 {
-                            crate::scanner::write_append_log(&format!(
-                                "audio: sceAudioOutOpenPort(MAIN fallback) failed: 0x{:08X} path={}",
-                                port as u32, path
-                            ));
-                            break 'decode TrackOutcome::Idle;
+                    let stereo_slice: &[i16] = if frame.channels == 1 {
+                        let mut out_idx = 0;
+                        for &s in raw_samples {
+                            stereo_converter[out_idx] = s;
+                            stereo_converter[out_idx + 1] = s;
+                            out_idx += 2;
+                        }
+                        &stereo_converter[..sample_count * 2]
+                    } else {
+                        raw_samples
+                    };
+
+                    let mut written_total = 0;
+                    while written_total < stereo_slice.len() {
+                        match rx.try_recv() {
+                            Ok(MusicCmd::Play(next)) => break 'stream DecodeOutcome::PlayNext(next),
+                            Ok(MusicCmd::Stop) => break 'stream DecodeOutcome::Stopped,
+                            Err(_) => {}
+                        }
+
+                        if let Ok(mut ring) = queue.ring.lock() {
+                            let written = ring.write_samples(&stereo_slice[written_total..]);
+                            written_total += written;
+                            if written > 0 {
+                                queue.cond_read.notify_one();
+                            }
+                        }
+
+                        if written_total < stereo_slice.len() {
+                            std::thread::sleep(std::time::Duration::from_millis(5));
                         }
                     }
+                    produced_audio = true;
+                } else if decode_rc < 0 {
+                    crate::logger::log(&format!(
+                        "audio: sceAudiodecDecode error: 0x{:08X} in {}",
+                        decode_rc as u32, path
+                    ));
                 }
-
-                let chunk_size = GRAIN_SIZE * channels;
-                while accum_len >= chunk_size {
-                    if port >= 0 {
-                        let out_rc = sceAudioOutOutput(port, pcm_accumulator.as_ptr() as *const _);
-                        if out_rc < 0 && !logged_decode_fail {
-                            crate::scanner::write_append_log(&format!("audio: sceAudioOutOutput failed: 0x{:08X}", out_rc as u32));
-                            logged_decode_fail = true;
-                        }
-                    }
-                    let rest = accum_len - chunk_size;
-                    if rest > 0 {
-                        let slice = pcm_accumulator.as_mut_slice();
-                        slice.copy_within(chunk_size..chunk_size + rest, 0);
-                    }
-                    accum_len = rest;
-                }
-            } else if decode_rc < 0 && !logged_decode_fail {
-                crate::scanner::write_append_log(&format!("audio: sceAudiodecDecode failed: 0x{:08X} path={}", decode_rc as u32, path));
-                logged_decode_fail = true;
             }
         }
 
         window.drain(0..offset + frame.len);
     };
 
-    if port >= 0 {
-        unsafe { sceAudioOutReleasePort(port) };
-    }
-
-    if !produced_audio {
-        crate::scanner::write_append_log(&format!(
-            "audio: {} produced no decodable audio; keeping file for diagnostics/retry",
-            path
-        ));
+    if let Some((mut c, _)) = ctrl {
+        unsafe {
+            let del_rc = sceAudiodecDeleteDecoder(&mut c);
+            if del_rc < 0 {
+                crate::logger::log(&format!("audio: sceAudiodecDeleteDecoder error: 0x{:08X}", del_rc as u32));
+            }
+        };
     }
 
     outcome
-}
-
-#[cfg(not(target_os = "vita"))]
-fn music_thread_main(rx: mpsc::Receiver<MusicCmd>) {
-    while rx.recv().is_ok() {}
 }
