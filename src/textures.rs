@@ -54,8 +54,13 @@ impl Default for TextureCache {
 
         std::thread::spawn(move || {
             while let Ok((key, kind, bytes)) = req_rx.recv() {
-                let image = decode(&bytes, kind);
-                let _ = res_tx.send((key, image));
+                let image = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    decode(&bytes, kind)
+                }))
+                .unwrap_or(None);
+                if res_tx.send((key, image)).is_err() {
+                    break;
+                }
             }
         });
 
@@ -102,9 +107,10 @@ impl TextureCache {
             return None;
         }
         if !self.pending.contains(key) && self.pending.len() < MAX_DECODE_PENDING {
-            self.pending.insert(key.to_string());
             let kind = TextureKind::from_key(key);
-            let _ = self.decode_tx.send((key.to_string(), kind, bytes.clone()));
+            if self.decode_tx.send((key.to_string(), kind, bytes.clone())).is_ok() {
+                self.pending.insert(key.to_string());
+            }
         }
         None
     }

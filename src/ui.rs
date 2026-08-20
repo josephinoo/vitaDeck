@@ -284,17 +284,31 @@ fn draw_game_card_with_painter(
     commands: &mut Vec<AppCommand>,
 ) {
     let selected = slot == app.selected;
-    let card_rect = if selected {
-        base_rect.expand2(Vec2::new(base_rect.width() * 0.035, base_rect.height() * 0.035))
-    } else {
-        base_rect
-    };
-    let rounding = CornerRadius::same(6);
+    let t = ui
+        .ctx()
+        .animate_bool_with_time(ui.id().with(("tile_anim", slot)), selected, 0.16);
+    let card_rect = base_rect.expand2(Vec2::new(
+        base_rect.width() * 0.035 * t,
+        base_rect.height() * 0.035 * t,
+    ));
+    let rounding = CornerRadius::same(12);
+
+    if t > 0.01 {
+        for i in 0..6 {
+            let grow = 1.5 + i as f32 * 2.4;
+            let alpha = (26.0 * t * (1.0 - i as f32 / 6.0)) as u8;
+            painter.rect_filled(
+                card_rect.expand(grow),
+                CornerRadius::same((12.0 + grow) as u8),
+                Color32::from_rgba_unmultiplied(255, 255, 255, alpha),
+            );
+        }
+    }
 
     let mut cover_drawn = false;
     if let Some(bytes) = game.cover_bytes.as_ref() {
         if let Some(handle) = app.texture_cache_get(ui.ctx(), &texture_key(game, "cover"), bytes) {
-            draw_texture_cover_with_painter(painter, &handle, card_rect);
+            draw_texture_cover_with_painter(painter, &handle, card_rect, rounding);
             cover_drawn = true;
         }
     }
@@ -310,7 +324,7 @@ fn draw_game_card_with_painter(
         painter.rect_stroke(
             card_rect,
             rounding,
-            Stroke::new(2.5_f32, COL_CARD_SELECTED_BORDER),
+            Stroke::new(2.5_f32 * t, COL_CARD_SELECTED_BORDER),
             egui::StrokeKind::Outside,
         );
     } else {
@@ -1315,7 +1329,7 @@ fn draw_store_detail(ui: &mut egui::Ui, app: &App, screen: Rect) {
     let mut hero_drawn = false;
     if let Some(bytes) = &detail.hero_bytes {
         if let Some(handle) = app.texture_cache_get(ui.ctx(), &texture_key(game, "hero"), bytes) {
-            draw_texture_cover_with_painter(ui.painter(), &handle, hero_rect);
+            draw_texture_cover_with_painter(ui.painter(), &handle, hero_rect, CornerRadius::ZERO);
             hero_drawn = true;
         }
     }
@@ -1323,7 +1337,7 @@ fn draw_store_detail(ui: &mut egui::Ui, app: &App, screen: Rect) {
     if !hero_drawn {
         if let Some(bytes) = cover_bytes {
             if let Some(handle) = app.texture_cache_get(ui.ctx(), &texture_key(game, "cover"), bytes) {
-                draw_texture_cover_with_painter(ui.painter(), &handle, hero_rect);
+                draw_texture_cover_with_painter(ui.painter(), &handle, hero_rect, CornerRadius::ZERO);
                 hero_drawn = true;
             }
         }
@@ -1342,7 +1356,7 @@ fn draw_store_detail(ui: &mut egui::Ui, app: &App, screen: Rect) {
     let mut cover_drawn = false;
     if let Some(bytes) = cover_bytes {
         if let Some(handle) = app.texture_cache_get(ui.ctx(), &texture_key(game, "cover"), bytes) {
-            draw_texture_cover_with_painter(ui.painter(), &handle, cover_rect);
+            draw_texture_cover_with_painter(ui.painter(), &handle, cover_rect, CornerRadius::same(12));
             cover_drawn = true;
         }
     }
@@ -1429,7 +1443,7 @@ fn draw_store_detail(ui: &mut egui::Ui, app: &App, screen: Rect) {
             if let Some(bytes) = maybe_bytes {
                 let key = format!("{}:{}:shot{index}", game.system.label(), game.title_id);
                 if let Some(handle) = app.texture_cache_get(ui.ctx(), &key, bytes) {
-                    draw_texture_cover_with_painter(ui.painter(), &handle, shot_rect);
+                    draw_texture_cover_with_painter(ui.painter(), &handle, shot_rect, CornerRadius::same(8));
                 }
             }
             let stroke = if detail.selected_shot == index {
@@ -1491,7 +1505,7 @@ fn draw_store_detail(ui: &mut egui::Ui, app: &App, screen: Rect) {
         if let Some(Some(bytes)) = detail.screenshots.get(index) {
             let key = format!("{}:{}:shot{index}", game.system.label(), game.title_id);
             if let Some(handle) = app.texture_cache_get(ui.ctx(), &key, bytes) {
-                draw_texture_cover_with_painter(ui.painter(), &handle, box_rect);
+                draw_texture_cover_with_painter(ui.painter(), &handle, box_rect, CornerRadius::same(8));
             }
         }
         ui.painter().rect_stroke(
@@ -1524,7 +1538,7 @@ fn draw_backdrop(ui: &mut egui::Ui, app: &App, screen: Rect) {
     let Some(bytes) = game.hero_bytes.as_ref() else { return };
     let Some(handle) = app.texture_cache_get(ui.ctx(), &texture_key(game, "hero"), bytes) else { return };
 
-    draw_texture_cover_with_painter(ui.painter(), &handle, screen);
+    draw_texture_cover_with_painter(ui.painter(), &handle, screen, CornerRadius::ZERO);
     filled_rect(ui, screen, Color32::from_rgba_unmultiplied(0, 0, 0, 160));
 
     horizontal_gradient_rect(
@@ -1637,20 +1651,32 @@ fn draw_cover_row(ui: &mut egui::Ui, app: &App, screen: Rect, commands: &mut Vec
         }
 
         let selected = slot == app.selected;
-        let (w, h) = if selected {
-            (TILE_W * TILE_SELECTED_SCALE, TILE_H * TILE_SELECTED_SCALE)
-        } else {
-            (TILE_W, TILE_H)
-        };
+        let t = ui
+            .ctx()
+            .animate_bool_with_time(ui.id().with(("cover_anim", slot)), selected, 0.16);
+        let grow = 1.0 + (TILE_SELECTED_SCALE - 1.0) * t;
+        let (w, h) = (TILE_W * grow, TILE_H * grow);
 
         let y = tile_y - (h - TILE_H) / 2.0;
         let rect = Rect::from_min_size(Pos2::new(x, y), Vec2::new(w, h));
-        let rounding = CornerRadius::same(6);
+        let rounding = CornerRadius::same(12);
+
+        if t > 0.01 {
+            for i in 0..6 {
+                let g = 1.5 + i as f32 * 2.4;
+                let alpha = (26.0 * t * (1.0 - i as f32 / 6.0)) as u8;
+                ui.painter().rect_filled(
+                    rect.expand(g),
+                    CornerRadius::same((12.0 + g) as u8),
+                    Color32::from_rgba_unmultiplied(255, 255, 255, alpha),
+                );
+            }
+        }
 
         let mut cover_drawn = false;
         if let Some(bytes) = &game.cover_bytes {
             if let Some(handle) = app.texture_cache_get(ui.ctx(), &texture_key(game, "cover"), bytes) {
-                draw_texture_cover_with_painter(ui.painter(), &handle, rect);
+                draw_texture_cover_with_painter(ui.painter(), &handle, rect, rounding);
                 cover_drawn = true;
             }
         }
@@ -1663,7 +1689,7 @@ fn draw_cover_row(ui: &mut egui::Ui, app: &App, screen: Rect, commands: &mut Vec
             ui.painter().rect_stroke(
                 rect,
                 rounding,
-                Stroke::new(2.5_f32, COL_CARD_SELECTED_BORDER),
+                Stroke::new(2.5_f32 * t, COL_CARD_SELECTED_BORDER),
                 egui::StrokeKind::Outside,
             );
         } else {
@@ -1694,7 +1720,12 @@ fn draw_cover_row(ui: &mut egui::Ui, app: &App, screen: Rect, commands: &mut Vec
     }
 }
 
-fn draw_texture_cover_with_painter(painter: &egui::Painter, handle: &egui::TextureHandle, rect: Rect) {
+fn draw_texture_cover_with_painter(
+    painter: &egui::Painter,
+    handle: &egui::TextureHandle,
+    rect: Rect,
+    rounding: CornerRadius,
+) {
     let size = handle.size_vec2();
     if size.x <= 0.0 || size.y <= 0.0 {
         return;
@@ -1704,5 +1735,13 @@ fn draw_texture_cover_with_painter(painter: &egui::Painter, handle: &egui::Textu
     let part_h = (rect.height() / scale).min(size.y);
     let uv_min = Pos2::new((size.x - part_w) / 2.0 / size.x, (size.y - part_h) / 2.0 / size.y);
     let uv_max = Pos2::new(uv_min.x + part_w / size.x, uv_min.y + part_h / size.y);
-    painter.image(handle.id(), rect, Rect::from_min_max(uv_min, uv_max), Color32::WHITE);
+    let uv = Rect::from_min_max(uv_min, uv_max);
+    if rounding == CornerRadius::ZERO {
+        painter.image(handle.id(), rect, uv, Color32::WHITE);
+    } else {
+        painter.add(
+            egui::epaint::RectShape::filled(rect, rounding, Color32::WHITE)
+                .with_texture(handle.id(), uv),
+        );
+    }
 }

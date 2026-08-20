@@ -637,7 +637,7 @@ fn decode_and_feed_mp3(
     let mut eof = false;
     let mut produced_audio = false;
     let mut logged_header = false;
-    let mut ctrl: Option<(SceAudiodecCtrl, SceAudiodecInfo)> = None;
+    let mut ctrl: Option<(SceAudiodecCtrl, Box<SceAudiodecInfo>)> = None;
     let mut decoder_created = false;
 
     let outcome = 'stream: loop {
@@ -685,7 +685,7 @@ fn decode_and_feed_mp3(
         }
 
         if !decoder_created {
-            let mut info: SceAudiodecInfo = unsafe { std::mem::zeroed() };
+            let mut info: Box<SceAudiodecInfo> = Box::new(unsafe { std::mem::zeroed() });
             info.mp3.size = size_of::<SceAudiodecInfoMp3>() as u32;
             info.mp3.ch = frame.channels;
             info.mp3.version = frame.version;
@@ -697,7 +697,7 @@ fn decode_and_feed_mp3(
             c.maxEsSize = es_buf.len as u32;
             c.pPcm = pcm_buf.as_mut_ptr() as *mut _;
             c.maxPcmSize = (pcm_buf.len * 2) as u32;
-            c.pInfo = &mut info;
+            c.pInfo = info.as_mut() as *mut SceAudiodecInfo;
 
             let create_rc = unsafe { sceAudiodecCreateDecoder(&mut c, SCE_AUDIODEC_TYPE_MP3) };
             if create_rc < 0 {
@@ -741,7 +741,7 @@ fn decode_and_feed_mp3(
                 c.maxEsSize = es_buf.len as u32;
                 c.pPcm = pcm_buf.as_mut_ptr() as *mut _;
                 c.maxPcmSize = (pcm_buf.len * 2) as u32;
-                c.pInfo = info as *mut SceAudiodecInfo;
+                c.pInfo = info.as_mut() as *mut SceAudiodecInfo;
 
                 let decode_rc = sceAudiodecDecode(c);
                 if decode_rc >= 0 && c.outputPcmSize > 0 {

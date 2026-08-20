@@ -27,6 +27,8 @@ const COVER_KEEP_RADIUS: usize = 18;
 const ART_LOOKAHEAD: usize = 10;
 
 const STORE_SHOT_BUDGET: usize = 2;
+const STORE_SHOT_KEEP_RADIUS: usize = 2;
+const MEMORY_POLL_FRAMES: u64 = 30;
 
 const SYSTEM_TABS: [(&str, Option<System>); 4] = [
     ("ALL", None),
@@ -151,11 +153,11 @@ impl App {
             let (scanned_games, scan_log) = scan_installed_games();
             crate::logger::log(&format!("Scan finished. Found {} games.", scanned_games.len()));
             crate::scanner::save_cached_games(&scanned_games);
-            let _ = scan_tx.send((scanned_games.clone(), scan_log));
+            let targets: Option<Vec<artwork::LookupTarget>> = net_ready
+                .then(|| scanned_games.iter().map(artwork::LookupTarget::from_game).collect());
+            let _ = scan_tx.send((scanned_games, scan_log));
 
-            if net_ready {
-                let targets: Vec<artwork::LookupTarget> =
-                    scanned_games.iter().map(artwork::LookupTarget::from_game).collect();
+            if let Some(targets) = targets {
                 let res = artwork::lookup_batch(&targets);
                 let _ = lookup_tx.send(res);
             }
@@ -631,9 +633,14 @@ impl App {
         }
     }
 
-    pub fn tick(&mut self, _ctx: &egui::Context) {
+    pub fn tick(&mut self, ctx: &egui::Context) {
         self.frame_counter = self.frame_counter.wrapping_add(1);
-        let (pressure, changed) = self.runtime.tick();
+        self.texture_cache.borrow_mut().pump(ctx);
+        let (pressure, changed) = if self.frame_counter % MEMORY_POLL_FRAMES == 0 {
+            self.runtime.tick()
+        } else {
+            (self.runtime.pressure(), false)
+        };
         if changed {
             crate::logger::log(&format!(
                 "memory pressure -> {} ({} MB free)",
@@ -720,9 +727,19 @@ impl App {
                 let selected_title_id =
                     self.visible.get(self.selected).and_then(|&i| self.games.get(i)).map(|g| g.title_id.clone());
 
+                let store_index = self.store_games.iter().position(|g| g.title_id == title_id);
+                let store_wants_cover = store_index
+                    .is_some_and(|index| self.is_store_tab() && self.cover_keep_set().contains(&index));
+                let mut cover = cover;
+
                 if let Some(game) = self.games.iter_mut().find(|g| g.title_id == title_id) {
-                    if let Some(cover_bytes) = cover.as_ref() {
-                        game.cover_bytes = Some((cover_bytes.is_png, cover_bytes.bytes.clone()));
+                    if let Some(is_png) = cover.as_ref().map(|c| c.is_png) {
+                        let bytes = if store_wants_cover {
+                            cover.as_ref().map(|c| c.bytes.clone()).unwrap_or_default()
+                        } else {
+                            cover.take().map(|c| c.bytes).unwrap_or_default()
+                        };
+                        game.cover_bytes = Some((is_png, bytes));
                         self.texture_cache.borrow_mut().invalidate(&format!("{}:{}:cover", game.system.label(), game.title_id));
                     }
                     if cover_ok {
@@ -748,12 +765,11 @@ impl App {
                 }
 
                 let mut store_discarded = false;
-                if let Some(index) = self.store_games.iter().position(|g| g.title_id == title_id) {
-                    let keep = self.is_store_tab() && self.cover_keep_set().contains(&index);
-                    if keep {
+                if let Some(index) = store_index {
+                    if store_wants_cover {
                         if let Some(game) = self.store_games.get_mut(index) {
-                            if let Some(cover_bytes) = cover.as_ref() {
-                                game.cover_bytes = Some((cover_bytes.is_png, cover_bytes.bytes.clone()));
+                            if let Some(cover_bytes) = cover.take() {
+                                game.cover_bytes = Some((cover_bytes.is_png, cover_bytes.bytes));
                                 self.texture_cache.borrow_mut().invalidate(&format!(
                                     "{}:{}:cover",
                                     game.system.label(),
@@ -1669,11 +1685,23 @@ impl App {
         if focus + 1 < n {
             order.push(focus + 1);
         }
-        for i in 0..n {
-            if !order.contains(&i) {
-                order.push(i);
+        for offset in 2..=STORE_SHOT_KEEP_RADIUS {
+            if focus >= offset && !order.contains(&(focus - offset)) {
+                order.push(focus - offset);
+            }
+            if focus + offset < n && !order.contains(&(focus + offset)) {
+                order.push(focus + offset);
             }
         }
+
+        if let Some(detail) = &mut self.store_detail {
+            for (i, slot) in detail.screenshots.iter_mut().enumerate() {
+                if slot.is_some() && !order.contains(&i) {
+                    *slot = None;
+                }
+            }
+        }
+
         let mut budget = STORE_SHOT_BUDGET - in_flight;
         for i in order {
             if budget == 0 {
@@ -1889,11 +1917,11 @@ impl App {
             crate::logger::log("Background rescan thread started");
             let (scanned_games, scan_log) = scan_installed_games();
             crate::scanner::save_cached_games(&scanned_games);
-            let _ = scan_tx.send((scanned_games.clone(), scan_log));
+            let targets: Option<Vec<artwork::LookupTarget>> = net_ready
+                .then(|| scanned_games.iter().map(artwork::LookupTarget::from_game).collect());
+            let _ = scan_tx.send((scanned_games, scan_log));
 
-            if net_ready {
-                let targets: Vec<artwork::LookupTarget> =
-                    scanned_games.iter().map(artwork::LookupTarget::from_game).collect();
+            if let Some(targets) = targets {
                 let res = artwork::lookup_batch(&targets);
                 let _ = lookup_tx.send(res);
             }
