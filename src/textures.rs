@@ -7,6 +7,7 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 const MAX_CACHE_BYTES: usize = 10 * 1024 * 1024;
 
 const MAX_DECODE_PENDING: usize = 6;
+const MAX_DECODE_RESULTS_PER_FRAME: usize = 1;
 
 #[derive(Clone, Copy)]
 enum TextureKind {
@@ -77,7 +78,8 @@ impl Default for TextureCache {
 impl TextureCache {
 
     pub fn pump(&mut self, ctx: &egui::Context) {
-        while let Ok((key, maybe_image)) = self.decode_rx.try_recv() {
+        for _ in 0..MAX_DECODE_RESULTS_PER_FRAME {
+            let Ok((key, maybe_image)) = self.decode_rx.try_recv() else { break };
             self.pending.remove(&key);
             match maybe_image {
                 Some(image) => {
@@ -94,12 +96,10 @@ impl TextureCache {
 
     pub fn get_or_decode(
         &mut self,
-        ctx: &egui::Context,
+        _ctx: &egui::Context,
         key: &str,
         bytes: &ImageBytes,
     ) -> Option<egui::TextureHandle> {
-        self.pump(ctx);
-
         if let Some(handle) = self.handles.get(key) {
             return Some(handle.clone());
         }

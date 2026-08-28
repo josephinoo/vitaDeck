@@ -1,3 +1,4 @@
+#[allow(dead_code)]
 pub enum ImeResult {
     Confirmed(String),
     Canceled,
@@ -28,6 +29,7 @@ impl ImeDialog {
         }
     }
 
+    #[allow(dead_code)]
     pub fn is_active(&self) -> bool {
         self.active
     }

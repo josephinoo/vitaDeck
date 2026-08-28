@@ -181,8 +181,13 @@ fn draw_full_loading_screen(ui: &mut egui::Ui, app: &App, screen: Rect) {
 
     let preload = app.preload_progress();
     let text = match preload {
-        Some((done, total)) => format!("Downloading artwork  {done} / {total}"),
-        None => format!("Scanning and indexing games from memory{dots}"),
+        Some((done, total)) => {
+            let mut args = fluent_bundle::FluentArgs::new();
+            args.set("done", done as i64);
+            args.set("total", total as i64);
+            app.i18n.format("loading-artwork", Some(&args))
+        }
+        None => app.i18n.format_one("loading-scan", "dots", dots),
     };
     let progress_frac = match preload {
         Some((done, total)) => done as f32 / total.max(1) as f32,
@@ -201,7 +206,7 @@ fn draw_full_loading_screen(ui: &mut egui::Ui, app: &App, screen: Rect) {
     let fill_rect = Rect::from_min_size(bar_rect.min, egui::vec2(bar_width * fill_frac.clamp(0.0, 1.0), bar_height));
     ui.painter().rect_filled(fill_rect, CornerRadius::same(5), Color32::from_rgb(80, 160, 240));
 
-    let subtext = "Please wait while the data loads...";
+    let subtext = app.text("loading-wait");
     let subfont = FontId::proportional(13.0);
     let subgalley = ui.painter().layout_no_wrap(subtext.to_string(), subfont, COL_TEXT_DIM);
     let subpos = screen.center() - egui::vec2(subgalley.rect.size().x / 2.0, -35.0);
@@ -451,7 +456,7 @@ fn draw_header(ui: &mut egui::Ui, app: &App, screen: Rect, commands: &mut Vec<Ap
         );
 
         let search_label = if app.search_query.is_empty() {
-            "Search the store..."
+            app.text("search-store")
         } else {
             &app.search_query
         };
@@ -534,10 +539,7 @@ fn draw_header(ui: &mut egui::Ui, app: &App, screen: Rect, commands: &mut Vec<Ap
 
     for (i, tab_name) in app.tabs.iter().enumerate() {
         let count = app.tab_count(i);
-        let display_name = match tab_name.as_str() {
-            "RECENTLY PLAYED" => "RECENT",
-            other => other,
-        };
+        let display_name = tab_name.as_str();
 
         let name_w = ui
             .fonts(|f| f.layout_no_wrap(display_name.to_string(), FontId::proportional(11.0), COL_TEXT))
@@ -677,65 +679,65 @@ fn draw_footer(ui: &mut egui::Ui, app: &App) {
     rounded_panel(ui, menu_rect, Color32::from_rgba_unmultiplied(255, 255, 255, 24));
     let menu_text = "VITA";
     label_mid(ui, menu_rect.left() + 10.0, mid_y, menu_text, 10.5, COL_TEXT);
-    label_mid(ui, menu_rect.right() + 8.0, mid_y, "MENU", 11.0, COL_TEXT_DIM);
+    label_mid(ui, menu_rect.right() + 8.0, mid_y, app.text("menu"), 11.0, COL_TEXT_DIM);
 
     let confirm_label = if app.mode == Mode::StoreDetail {
         if let Some(detail) = &app.store_detail {
             if app.is_title_installed(&detail.title_id) {
-                "LAUNCH"
+                app.text("launch")
             } else {
-                "INSTALL"
+                app.text("install")
             }
         } else {
-            "INSTALL"
+            app.text("install")
         }
     } else if app.is_store_tab() {
-        "DETAILS"
+        app.text("details")
     } else if selected_game(app).is_some_and(|g| g.system == crate::scanner::System::Vita) {
-        "LAUNCH"
+        app.text("launch")
     } else {
-        "SELECT"
+        app.text("select")
     };
 
     let search_label = if app.search_active && !app.search_query.is_empty() {
-        "CLEAR SEARCH"
+        app.text("clear-search")
     } else {
-        "SEARCH"
+        app.text("search")
     };
 
     let hints: Vec<(Glyph, &str)> = if app.is_settings() {
         let action = match app.settings_selected {
-            0 => "RESCAN",
-            1 => "TOGGLE",
-            2 => "CHANGE",
-            3 => "CLEAN",
-            4 => "PURGE MUSIC",
-            _ => "PURGE ALL",
+            0 => app.text("rescan"),
+            1 => app.text("toggle"),
+            2 | 3 => app.text("change"),
+            4 => app.text("clean"),
+            5 => app.text("purge-music"),
+            _ => app.text("purge-all"),
         };
         vec![
             (Glyph::Cross, action),
-            (Glyph::Circle, "BACK"),
-            (Glyph::Start, "CLOSE"),
+            (Glyph::Circle, app.text("back")),
+            (Glyph::Start, app.text("close")),
         ]
     } else if app.mode == Mode::CollectionPicker {
-        vec![(Glyph::Cross, "TOGGLE"), (Glyph::Circle, "BACK")]
+        vec![(Glyph::Cross, app.text("toggle")), (Glyph::Circle, app.text("back"))]
     } else if app.mode == Mode::StoreDetail {
         let mut hints = Vec::new();
         if app.store_detail.as_ref().is_some_and(|d| d.lightbox.is_some()) {
-            hints.push((Glyph::Triangle, "CLOSE"));
+            hints.push((Glyph::Triangle, app.text("close")));
         } else if app.store_detail.as_ref().is_some_and(|d| !d.screenshot_urls.is_empty()) {
-            hints.push((Glyph::Triangle, "VIEW"));
+            hints.push((Glyph::Triangle, app.text("view")));
         }
         hints.push((Glyph::Cross, confirm_label));
-        hints.push((Glyph::Circle, "BACK"));
+        hints.push((Glyph::Circle, app.text("back")));
         hints
     } else {
         let mut hints = Vec::new();
         if app.tab_is_collection() {
-            hints.push((Glyph::Square, "REMOVE"));
+            hints.push((Glyph::Square, app.text("remove")));
         }
         if !app.visible.is_empty() {
-            hints.push((Glyph::Triangle, "COLLECTIONS"));
+            hints.push((Glyph::Triangle, app.text("collections")));
         }
         if app.is_store_tab() {
             hints.push((Glyph::Select, search_label));
@@ -743,7 +745,7 @@ fn draw_footer(ui: &mut egui::Ui, app: &App) {
         if !app.visible.is_empty() {
             hints.push((Glyph::Cross, confirm_label));
         }
-        hints.push((Glyph::Start, "SETTINGS"));
+        hints.push((Glyph::Start, app.text("settings")));
         hints
     };
 
@@ -755,6 +757,7 @@ fn draw_footer(ui: &mut egui::Ui, app: &App) {
             .x;
         let icon_w = match glyph {
             Glyph::Select => 26.0,
+            Glyph::Start => 28.0,
             _ => 16.0,
         };
 
@@ -771,6 +774,7 @@ fn draw_footer(ui: &mut egui::Ui, app: &App) {
 fn draw_button_glyph(ui: &mut egui::Ui, center: Pos2, glyph: Glyph) {
     let size = match glyph {
         Glyph::Select => Vec2::new(26.0, 14.0),
+        Glyph::Start => Vec2::new(28.0, 14.0),
         _ => Vec2::splat(16.0),
     };
     let rect = Rect::from_center_size(center, size);
@@ -796,7 +800,10 @@ fn draw_button_glyph(ui: &mut egui::Ui, center: Pos2, glyph: Glyph) {
             "builtin:btn_select",
             include_bytes!("../assets/buttons/outline-select.png").as_slice(),
         )),
-        Glyph::Start => None,
+        Glyph::Start => Some((
+            "builtin:btn_start",
+            include_bytes!("../assets/buttons/outline-start.png").as_slice(),
+        )),
     };
 
     if let Some((name, bytes)) = maybe_asset {
@@ -849,6 +856,7 @@ fn preload_button_icons(ui: &mut egui::Ui) {
         ("builtin:btn_triangle", include_bytes!("../assets/buttons/outline-green-triangle.png")),
         ("builtin:btn_square", include_bytes!("../assets/buttons/outline-purple-square.png")),
         ("builtin:btn_select", include_bytes!("../assets/buttons/outline-select.png")),
+        ("builtin:btn_start", include_bytes!("../assets/buttons/outline-start.png")),
         ("builtin:btn_l1", include_bytes!("../assets/buttons/outline-L1.png")),
         ("builtin:btn_r1", include_bytes!("../assets/buttons/outline-R1.png")),
     ];
@@ -938,7 +946,7 @@ fn draw_collection_picker(ui: &mut egui::Ui, app: &App, screen: Rect, commands: 
     rounded_panel(ui, panel_rect, Color32::from_rgb(18, 20, 26));
     ui.painter().rect_stroke(panel_rect, CornerRadius::same(10), Stroke::new(1.0_f32, Color32::from_rgb(45, 52, 65)), egui::StrokeKind::Inside);
 
-    label_at(ui, Pos2::new(panel_rect.left() + 20.0, panel_rect.top() + 14.0), "COLLECTIONS", 13.0, COL_TEXT_DIM);
+    label_at(ui, Pos2::new(panel_rect.left() + 20.0, panel_rect.top() + 14.0), app.text("collection-title"), 13.0, COL_TEXT_DIM);
 
     let Some(game) = selected_game(app) else { return };
     let row_start_y = panel_rect.top() + 42.0;
@@ -1012,10 +1020,10 @@ fn draw_download_confirm_modal(
     let center_x = panel_rect.center().x;
 
     let header_y = panel_rect.top() + 22.0;
-    label_center(ui, center_x, header_y, "CONFIRM DOWNLOAD", 13.5, Color32::from_rgb(56, 189, 248));
+    label_center(ui, center_x, header_y, app.text("confirm-download"), 13.5, Color32::from_rgb(56, 189, 248));
 
     let prompt_y = header_y + 26.0;
-    label_center(ui, center_x, prompt_y, "Download this game to your console?", 11.5, COL_TEXT_DIM);
+    label_center(ui, center_x, prompt_y, app.text("download-question"), 11.5, COL_TEXT_DIM);
 
     let name_y = prompt_y + 30.0;
     let title_display = if confirm.title.chars().count() > 36 {
@@ -1065,7 +1073,7 @@ fn draw_download_confirm_modal(
         ui,
         left_btn_rect.center().x,
         left_btn_rect.center().y,
-        "YES, DOWNLOAD",
+        app.text("download-yes"),
         12.0,
         if sel_yes { Color32::WHITE } else { COL_TEXT_DIM },
     );
@@ -1094,7 +1102,7 @@ fn draw_download_confirm_modal(
         ui,
         right_btn_rect.center().x,
         right_btn_rect.center().y,
-        "CANCEL",
+        app.text("cancel"),
         12.0,
         if sel_no { Color32::WHITE } else { COL_TEXT_DIM },
     );
@@ -1108,8 +1116,9 @@ fn draw_download_confirm_modal(
 
 fn draw_settings(ui: &mut egui::Ui, app: &App, screen: Rect, commands: &mut Vec<AppCommand>) {
     let left = screen.left() + MARGIN_X;
-    let col_w = 420.0;
-    let right_col = left + col_w + 20.0;
+    let col_gap = 16.0;
+    let col_w = ((screen.width() - MARGIN_X * 2.0 - col_gap) / 2.0).max(230.0);
+    let right_col = left + col_w + col_gap;
     let mut y_left = screen.top() + HEADER_H + 16.0;
     let mut y_right = screen.top() + HEADER_H + 16.0;
 
@@ -1120,8 +1129,8 @@ fn draw_settings(ui: &mut egui::Ui, app: &App, screen: Rect, commands: &mut Vec<
         "builtin:icon_settings",
         include_bytes!("../assets/icons/icon-settings.png"),
     );
-    label_at(ui, Pos2::new(left + 30.0, y_left), "General & Library", 20.0, COL_TEXT);
-    y_left += 30.0;
+    label_at(ui, Pos2::new(left + 30.0, y_left), app.text("settings-general"), 17.0, COL_TEXT);
+    y_left += 28.0;
 
     let vita_games = app.games.iter().filter(|g| g.system == crate::scanner::System::Vita).count();
     let psp_games = app.games.iter().filter(|g| g.system == crate::scanner::System::Psp).count();
@@ -1132,114 +1141,126 @@ fn draw_settings(ui: &mut egui::Ui, app: &App, screen: Rect, commands: &mut Vec<
     let tex_budget_kb = app.texture_budget_bytes() / 1024;
 
     let rows = [
-        ("Version".to_string(), format!("VitaDeck {}", env!("CARGO_PKG_VERSION"))),
-        ("Library".to_string(), format!("{} PS Vita  ·  {} PSP  ·  {} PS1", vita_games, psp_games, psx_games)),
-        ("Collections".to_string(), format!("{}", app.collections.items.len())),
-        ("Wi-Fi".to_string(), if app.wifi_connected() { "connected".to_string() } else { "offline".to_string() }),
-        ("Free RAM".to_string(), format!("{} MB  ·  {}", free_mb, app.runtime.pressure().label())),
-        ("Textures".to_string(), format!("{} KB / {} KB", tex_used_kb, tex_budget_kb)),
+        (app.text("settings-version").to_string(), format!("VitaDeck {}", env!("CARGO_PKG_VERSION"))),
+        (app.text("settings-library").to_string(), format!("{} PS Vita  ·  {} PSP  ·  {} PS1", vita_games, psp_games, psx_games)),
+        (app.text("settings-collections").to_string(), format!("{}", app.collections.items.len())),
+        (app.text("settings-wifi").to_string(), app.text(if app.wifi_connected() { "status-connected" } else { "status-offline" }).to_string()),
+        (app.text("settings-free-ram").to_string(), format!("{} MB  ·  {}", free_mb, app.runtime.pressure().label())),
+        (app.text("settings-textures").to_string(), format!("{} KB / {} KB", tex_used_kb, tex_budget_kb)),
     ];
 
     for (label, value) in rows {
-        label_at(ui, Pos2::new(left, y_left), &label, 12.0, COL_TEXT_DIM);
-        label_at(ui, Pos2::new(left + 110.0, y_left), &value, 12.0, COL_TEXT);
-        y_left += 20.0;
+        label_at(ui, Pos2::new(left, y_left), &label, 11.0, COL_TEXT_DIM);
+        label_at(ui, Pos2::new(left + 105.0, y_left), &value, 11.0, COL_TEXT);
+        y_left += 18.0;
     }
 
-    y_left += 10.0;
+    y_left += 6.0;
 
-    let btn_rescan = Rect::from_min_size(Pos2::new(left, y_left), Vec2::new(col_w, 32.0));
+    let btn_rescan = Rect::from_min_size(Pos2::new(left, y_left), Vec2::new(col_w, 28.0));
     let sel_0 = app.settings_selected == 0;
     let bg_col_0 = if sel_0 { Color32::from_rgba_unmultiplied(56, 189, 248, 60) } else { Color32::from_rgba_unmultiplied(56, 189, 248, 20) };
     let border_col_0 = if sel_0 { Color32::from_rgb(56, 189, 248) } else { Color32::from_rgba_unmultiplied(56, 189, 248, 100) };
     rounded_panel(ui, btn_rescan, bg_col_0);
     ui.painter().rect_stroke(btn_rescan, CornerRadius::same(6), Stroke::new(if sel_0 { 2.0_f32 } else { 1.0_f32 }, border_col_0), egui::StrokeKind::Inside);
-    label_at(ui, Pos2::new(btn_rescan.left() + 16.0, btn_rescan.center().y - 7.0), "⟳ RESCAN LIBRARY", 12.0, Color32::WHITE);
+    label_at(ui, Pos2::new(btn_rescan.left() + 14.0, btn_rescan.center().y - 6.0), app.text("rescan"), 11.0, Color32::WHITE);
     if ui.interact(btn_rescan, ui.id().with("rescan_btn"), Sense::click()).clicked() {
         commands.push(AppCommand::Rescan);
     }
-    y_left += 40.0;
+    y_left += 34.0;
 
-    let card_bgm = Rect::from_min_size(Pos2::new(left, y_left), Vec2::new(col_w, 42.0));
+    let card_bgm = Rect::from_min_size(Pos2::new(left, y_left), Vec2::new(col_w, 36.0));
     let sel_1 = app.settings_selected == 1;
     let bg_col_1 = if sel_1 { Color32::from_rgba_unmultiplied(255, 255, 255, 25) } else { Color32::from_rgba_unmultiplied(255, 255, 255, 10) };
     let border_col_1 = if sel_1 { Color32::from_rgb(56, 189, 248) } else { Color32::from_rgba_unmultiplied(255, 255, 255, 20) };
     rounded_panel(ui, card_bgm, bg_col_1);
     ui.painter().rect_stroke(card_bgm, CornerRadius::same(6), Stroke::new(if sel_1 { 2.0_f32 } else { 1.0_f32 }, border_col_1), egui::StrokeKind::Inside);
-    label_at(ui, Pos2::new(card_bgm.left() + 12.0, card_bgm.top() + 6.0), "Download BGM (Music)", 12.0, COL_TEXT);
-    label_at(ui, Pos2::new(card_bgm.left() + 12.0, card_bgm.top() + 23.0), "Disabled saves ~3 MB per game", 10.0, COL_TEXT_DIM);
+    label_at(ui, Pos2::new(card_bgm.left() + 12.0, card_bgm.top() + 5.0), app.text("settings-bgm"), 11.0, COL_TEXT);
+    label_at(ui, Pos2::new(card_bgm.left() + 12.0, card_bgm.top() + 20.0), app.text("settings-bgm-hint"), 9.0, COL_TEXT_DIM);
     let bgm_status = if app.config.download_bgm { "[ ON ]" } else { "[ OFF ]" };
     let bgm_color = if app.config.download_bgm { Color32::from_rgb(74, 222, 128) } else { Color32::from_rgb(248, 113, 113) };
-    label_at(ui, Pos2::new(card_bgm.right() - 60.0, card_bgm.top() + 12.0), bgm_status, 12.0, bgm_color);
+    label_at(ui, Pos2::new(card_bgm.right() - 52.0, card_bgm.top() + 10.0), bgm_status, 11.0, bgm_color);
     if ui.interact(card_bgm, ui.id().with("bgm_card"), Sense::click()).clicked() {
         commands.push(AppCommand::ToggleDownloadBgm);
     }
-    y_left += 50.0;
+    y_left += 42.0;
 
-    let card_budget = Rect::from_min_size(Pos2::new(left, y_left), Vec2::new(col_w, 42.0));
+    let card_language = Rect::from_min_size(Pos2::new(left, y_left), Vec2::new(col_w, 36.0));
     let sel_2 = app.settings_selected == 2;
     let bg_col_2 = if sel_2 { Color32::from_rgba_unmultiplied(255, 255, 255, 25) } else { Color32::from_rgba_unmultiplied(255, 255, 255, 10) };
     let border_col_2 = if sel_2 { Color32::from_rgb(56, 189, 248) } else { Color32::from_rgba_unmultiplied(255, 255, 255, 20) };
-    rounded_panel(ui, card_budget, bg_col_2);
-    ui.painter().rect_stroke(card_budget, CornerRadius::same(6), Stroke::new(if sel_2 { 2.0_f32 } else { 1.0_f32 }, border_col_2), egui::StrokeKind::Inside);
-    label_at(ui, Pos2::new(card_budget.left() + 12.0, card_budget.top() + 6.0), "Disk Cache Limit", 12.0, COL_TEXT);
-    label_at(ui, Pos2::new(card_budget.left() + 12.0, card_budget.top() + 23.0), "Auto-evicts oldest music & hero art", 10.0, COL_TEXT_DIM);
-    label_at(ui, Pos2::new(card_budget.right() - 85.0, card_budget.top() + 12.0), app.config.budget_label(), 12.0, Color32::from_rgb(56, 189, 248));
+    rounded_panel(ui, card_language, bg_col_2);
+    ui.painter().rect_stroke(card_language, CornerRadius::same(6), Stroke::new(if sel_2 { 2.0_f32 } else { 1.0_f32 }, border_col_2), egui::StrokeKind::Inside);
+    label_at(ui, Pos2::new(card_language.left() + 12.0, card_language.top() + 5.0), app.text("settings-language"), 11.0, COL_TEXT);
+    label_at(ui, Pos2::new(card_language.left() + 12.0, card_language.top() + 20.0), app.locale_name(app.config.locale), 9.0, COL_TEXT_DIM);
+    if ui.interact(card_language, ui.id().with("language_card"), Sense::click()).clicked() {
+        commands.push(AppCommand::CycleLanguage);
+    }
+    label_at(ui, Pos2::new(right_col, y_right), app.text("settings-storage"), 16.0, COL_TEXT);
+    y_right += 24.0;
+
+    let card_budget = Rect::from_min_size(Pos2::new(right_col, y_right), Vec2::new(col_w, 34.0));
+    let sel_3 = app.settings_selected == 3;
+    let bg_col_3 = if sel_3 { Color32::from_rgba_unmultiplied(255, 255, 255, 25) } else { Color32::from_rgba_unmultiplied(255, 255, 255, 10) };
+    let border_col_3 = if sel_3 { Color32::from_rgb(56, 189, 248) } else { Color32::from_rgba_unmultiplied(255, 255, 255, 20) };
+    rounded_panel(ui, card_budget, bg_col_3);
+    ui.painter().rect_stroke(card_budget, CornerRadius::same(6), Stroke::new(if sel_3 { 2.0_f32 } else { 1.0_f32 }, border_col_3), egui::StrokeKind::Inside);
+    label_at(ui, Pos2::new(card_budget.left() + 12.0, card_budget.top() + 5.0), app.text("settings-cache-limit"), 11.0, COL_TEXT);
+    label_at(ui, Pos2::new(card_budget.left() + 12.0, card_budget.top() + 19.0), app.text("settings-cache-hint"), 8.5, COL_TEXT_DIM);
+    label_at(ui, Pos2::new(card_budget.right() - 70.0, card_budget.top() + 10.0), app.budget_label(), 10.0, Color32::from_rgb(56, 189, 248));
     if ui.interact(card_budget, ui.id().with("budget_card"), Sense::click()).clicked() {
         commands.push(AppCommand::CycleCacheBudget);
     }
-
-    label_at(ui, Pos2::new(right_col, y_right), "Storage & Optimization", 20.0, COL_TEXT);
-    y_right += 30.0;
+    y_right += 38.0;
 
     let stats = &app.cache_stats;
     let cache_rows = [
-        ("Covers & Boxes".to_string(), crate::cache_manager::format_bytes(stats.covers_bytes)),
-        ("Hero & Logos".to_string(), crate::cache_manager::format_bytes(stats.hero_bytes + stats.logo_bytes)),
-        ("Background Music".to_string(), crate::cache_manager::format_bytes(stats.music_bytes)),
-        ("Total Used".to_string(), crate::cache_manager::format_bytes(stats.total_bytes)),
-        ("Orphaned Files".to_string(), format!("{} ({})", stats.orphan_count, crate::cache_manager::format_bytes(stats.orphan_bytes))),
+        (app.text("settings-covers").to_string(), crate::cache_manager::format_bytes(stats.covers_bytes)),
+        (app.text("settings-heroes").to_string(), crate::cache_manager::format_bytes(stats.hero_bytes + stats.logo_bytes)),
+        (app.text("settings-music").to_string(), crate::cache_manager::format_bytes(stats.music_bytes)),
+        (app.text("settings-total").to_string(), crate::cache_manager::format_bytes(stats.total_bytes)),
+        (app.text("settings-orphans").to_string(), format!("{} ({})", stats.orphan_count, crate::cache_manager::format_bytes(stats.orphan_bytes))),
     ];
 
     for (label, value) in cache_rows {
-        label_at(ui, Pos2::new(right_col, y_right), &label, 12.0, COL_TEXT_DIM);
-        label_at(ui, Pos2::new(right_col + 130.0, y_right), &value, 12.0, COL_TEXT);
-        y_right += 20.0;
+        label_at(ui, Pos2::new(right_col, y_right), &label, 10.0, COL_TEXT_DIM);
+        label_at(ui, Pos2::new(right_col + 118.0, y_right), &value, 10.0, COL_TEXT);
+        y_right += 14.0;
     }
 
-    y_right += 10.0;
+    y_right += 4.0;
 
-    let btn_clean = Rect::from_min_size(Pos2::new(right_col, y_right), Vec2::new(col_w, 32.0));
-    let sel_3 = app.settings_selected == 3;
-    let bg_col_3 = if sel_3 { Color32::from_rgba_unmultiplied(234, 179, 8, 40) } else { Color32::from_rgba_unmultiplied(234, 179, 8, 15) };
-    let border_col_3 = if sel_3 { Color32::from_rgb(234, 179, 8) } else { Color32::from_rgba_unmultiplied(234, 179, 8, 80) };
-    rounded_panel(ui, btn_clean, bg_col_3);
-    ui.painter().rect_stroke(btn_clean, CornerRadius::same(6), Stroke::new(if sel_3 { 2.0_f32 } else { 1.0_f32 }, border_col_3), egui::StrokeKind::Inside);
-    label_at(ui, Pos2::new(btn_clean.left() + 16.0, btn_clean.center().y - 7.0), "CLEAN ORPHANED CACHE", 12.0, Color32::WHITE);
+    let btn_clean = Rect::from_min_size(Pos2::new(right_col, y_right), Vec2::new(col_w, 26.0));
+    let sel_4 = app.settings_selected == 4;
+    let bg_col_4 = if sel_4 { Color32::from_rgba_unmultiplied(234, 179, 8, 40) } else { Color32::from_rgba_unmultiplied(234, 179, 8, 15) };
+    let border_col_4 = if sel_4 { Color32::from_rgb(234, 179, 8) } else { Color32::from_rgba_unmultiplied(234, 179, 8, 80) };
+    rounded_panel(ui, btn_clean, bg_col_4);
+    ui.painter().rect_stroke(btn_clean, CornerRadius::same(6), Stroke::new(if sel_4 { 2.0_f32 } else { 1.0_f32 }, border_col_4), egui::StrokeKind::Inside);
+    label_at(ui, Pos2::new(btn_clean.left() + 12.0, btn_clean.center().y - 5.5), app.text("settings-clean-orphans"), 10.0, Color32::WHITE);
     if ui.interact(btn_clean, ui.id().with("clean_orphans_btn"), Sense::click()).clicked() {
         commands.push(AppCommand::CleanOrphanCache);
     }
-    y_right += 38.0;
+    y_right += 30.0;
 
-    let btn_purge_music = Rect::from_min_size(Pos2::new(right_col, y_right), Vec2::new(col_w, 32.0));
-    let sel_4 = app.settings_selected == 4;
-    let bg_col_4 = if sel_4 { Color32::from_rgba_unmultiplied(244, 63, 94, 40) } else { Color32::from_rgba_unmultiplied(244, 63, 94, 15) };
-    let border_col_4 = if sel_4 { Color32::from_rgb(244, 63, 94) } else { Color32::from_rgba_unmultiplied(244, 63, 94, 80) };
-    rounded_panel(ui, btn_purge_music, bg_col_4);
-    ui.painter().rect_stroke(btn_purge_music, CornerRadius::same(6), Stroke::new(if sel_4 { 2.0_f32 } else { 1.0_f32 }, border_col_4), egui::StrokeKind::Inside);
-    label_at(ui, Pos2::new(btn_purge_music.left() + 16.0, btn_purge_music.center().y - 7.0), "PURGE MUSIC CACHE", 12.0, Color32::WHITE);
+    let btn_purge_music = Rect::from_min_size(Pos2::new(right_col, y_right), Vec2::new(col_w, 26.0));
+    let sel_5 = app.settings_selected == 5;
+    let bg_col_5 = if sel_5 { Color32::from_rgba_unmultiplied(244, 63, 94, 40) } else { Color32::from_rgba_unmultiplied(244, 63, 94, 15) };
+    let border_col_5 = if sel_5 { Color32::from_rgb(244, 63, 94) } else { Color32::from_rgba_unmultiplied(244, 63, 94, 80) };
+    rounded_panel(ui, btn_purge_music, bg_col_5);
+    ui.painter().rect_stroke(btn_purge_music, CornerRadius::same(6), Stroke::new(if sel_5 { 2.0_f32 } else { 1.0_f32 }, border_col_5), egui::StrokeKind::Inside);
+    label_at(ui, Pos2::new(btn_purge_music.left() + 12.0, btn_purge_music.center().y - 5.5), app.text("settings-purge-music"), 10.0, Color32::WHITE);
     if ui.interact(btn_purge_music, ui.id().with("purge_music_btn"), Sense::click()).clicked() {
         commands.push(AppCommand::PurgeMusicCache);
     }
-    y_right += 38.0;
+    y_right += 30.0;
 
-    let btn_purge_all = Rect::from_min_size(Pos2::new(right_col, y_right), Vec2::new(col_w, 32.0));
-    let sel_5 = app.settings_selected == 5;
-    let bg_col_5 = if sel_5 { Color32::from_rgba_unmultiplied(239, 68, 68, 40) } else { Color32::from_rgba_unmultiplied(239, 68, 68, 15) };
-    let border_col_5 = if sel_5 { Color32::from_rgb(239, 68, 68) } else { Color32::from_rgba_unmultiplied(239, 68, 68, 80) };
-    rounded_panel(ui, btn_purge_all, bg_col_5);
-    ui.painter().rect_stroke(btn_purge_all, CornerRadius::same(6), Stroke::new(if sel_5 { 2.0_f32 } else { 1.0_f32 }, border_col_5), egui::StrokeKind::Inside);
-    label_at(ui, Pos2::new(btn_purge_all.left() + 16.0, btn_purge_all.center().y - 7.0), "PURGE ALL CACHE", 12.0, Color32::WHITE);
+    let btn_purge_all = Rect::from_min_size(Pos2::new(right_col, y_right), Vec2::new(col_w, 26.0));
+    let sel_6 = app.settings_selected == 6;
+    let bg_col_6 = if sel_6 { Color32::from_rgba_unmultiplied(239, 68, 68, 40) } else { Color32::from_rgba_unmultiplied(239, 68, 68, 15) };
+    let border_col_6 = if sel_6 { Color32::from_rgb(239, 68, 68) } else { Color32::from_rgba_unmultiplied(239, 68, 68, 80) };
+    rounded_panel(ui, btn_purge_all, bg_col_6);
+    ui.painter().rect_stroke(btn_purge_all, CornerRadius::same(6), Stroke::new(if sel_6 { 2.0_f32 } else { 1.0_f32 }, border_col_6), egui::StrokeKind::Inside);
+    label_at(ui, Pos2::new(btn_purge_all.left() + 12.0, btn_purge_all.center().y - 5.5), app.text("settings-purge-all"), 10.0, Color32::WHITE);
     if ui.interact(btn_purge_all, ui.id().with("purge_all_btn"), Sense::click()).clicked() {
         commands.push(AppCommand::PurgeAllCache);
     }
@@ -1253,7 +1274,7 @@ fn draw_settings(ui: &mut egui::Ui, app: &App, screen: Rect, commands: &mut Vec<
 }
 
 fn draw_empty_state(ui: &mut egui::Ui, app: &App, screen: Rect) {
-    label_at(ui, screen.min + Vec2::new(MARGIN_X, HEADER_H + 40.0), "No games found in this tab", 18.0, Color32::from_rgb(255, 210, 90));
+    label_at(ui, screen.min + Vec2::new(MARGIN_X, HEADER_H + 40.0), app.text("empty-games"), 18.0, Color32::from_rgb(255, 210, 90));
 
     let mut line_y = HEADER_H + 70.0;
     for line in app.scan_log.iter().take(8) {
@@ -1263,7 +1284,7 @@ fn draw_empty_state(ui: &mut egui::Ui, app: &App, screen: Rect) {
     label_at(
         ui,
         screen.min + Vec2::new(MARGIN_X, line_y + 6.0),
-        "Full log at ux0:data/VitaDeck/scan_log.txt",
+        app.text("empty-log"),
         11.0,
         Color32::from_rgb(140, 140, 140),
     );
@@ -1289,7 +1310,7 @@ fn draw_no_cover_with_painter(
     painter.text(
         rect.center(),
         egui::Align2::CENTER_CENTER,
-        "No Cover",
+        app.text("no-cover"),
         FontId::proportional(font_size),
         Color32::from_rgb(24, 24, 24),
     );
@@ -1415,9 +1436,9 @@ fn draw_store_detail(ui: &mut egui::Ui, app: &App, screen: Rect) {
     }
 
     let cta_label = if app.is_title_installed(&game.title_id) {
-        "LAUNCH"
+        app.text("launch")
     } else {
-        "INSTALL"
+        app.text("install")
     };
     let cta_rect = Rect::from_min_size(Pos2::new(text_left, text_y + 4.0), Vec2::new(110.0, 26.0));
     ui.painter().rect_filled(cta_rect, CornerRadius::same(6), Color32::from_rgb(56, 189, 248));
@@ -1642,7 +1663,12 @@ fn draw_cover_row(ui: &mut egui::Ui, app: &App, screen: Rect, commands: &mut Vec
     let row_right = screen.right() - MARGIN_X;
     let tile_y = cover_row_top(screen);
 
-    for (slot, &game_index) in app.visible.iter().enumerate() {
+    let first_slot = ((app.current_scroll - TILE_W) / TILE_SPACING).floor().max(0.0) as usize;
+    let last_slot = ((app.current_scroll + (row_right - row_left)) / TILE_SPACING)
+        .ceil()
+        .max(0.0) as usize + 1;
+    for slot in first_slot..last_slot.min(app.visible.len()) {
+        let Some(&game_index) = app.visible.get(slot) else { continue };
         let Some(game) = app.games.get(game_index) else { continue };
 
         let x = (row_left + slot as f32 * TILE_SPACING - app.current_scroll).round();

@@ -10,6 +10,7 @@ use std::sync::OnceLock;
 #[cfg(target_os = "vita")]
 use vitasdk_sys::*;
 
+#[allow(dead_code)]
 pub const BGDL_TYPE_PSP: u32 = 0x00;
 #[allow(dead_code)]
 pub const BGDL_TYPE_PSM: u32 = 0x06;
@@ -23,8 +24,6 @@ const RIF_SIZE: usize = 512;
 const PSP_RIF_SIZE: usize = 0x98;
 #[cfg(target_os = "vita")]
 const PSM_RIF_SIZE: usize = 1024;
-#[cfg(target_os = "vita")]
-const MAX_QUEUED: usize = 32;
 
 #[cfg(target_os = "vita")]
 #[repr(C)]
@@ -404,6 +403,7 @@ pub fn start_bgdl(title: &str, url: &str, rif: Option<&[u8]>, bgdl_type: u32) ->
     Ok(())
 }
 
+#[allow(dead_code)]
 pub fn log_bgdl(msg: &str) {
     crate::logger::log(&format!("[BGDL] {msg}"));
 }

@@ -10,6 +10,7 @@ pub enum InputCommand {
     MoveRight,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppCommand {
     Input(InputCommand),
@@ -22,6 +23,7 @@ pub enum AppCommand {
     ToggleSearch,
     Rescan,
     ToggleDownloadBgm,
+    CycleLanguage,
     CycleCacheBudget,
     CleanOrphanCache,
     PurgeMusicCache,

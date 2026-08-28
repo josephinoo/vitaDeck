@@ -413,8 +413,6 @@ struct GameDetail {
     #[serde(default)]
     title_id: Option<String>,
     #[serde(default)]
-    platform: Option<String>,
-    #[serde(default)]
     cover_path: Option<String>,
     #[serde(default)]
     logos: Vec<String>,

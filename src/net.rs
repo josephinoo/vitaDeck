@@ -6,7 +6,9 @@ use std::time::{Duration, Instant};
 
 pub const API_BASE: &str = env!("VITADECK_API_BASE");
 
+#[allow(dead_code)]
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+#[allow(dead_code)]
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_REDIRECTS: u32 = 10;
 const USER_AGENT: &str = "Mozilla/5.0 (PlayStation Vita 3.60) AppleWebKit/537.73 (KHTML, like Gecko) VitaDeck/1.0";

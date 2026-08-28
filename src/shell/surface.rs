@@ -3,6 +3,7 @@ use anyhow::{Context, Result};
 use sdl2::render::Canvas;
 use sdl2::video::Window;
 
+#[allow(dead_code)]
 #[derive(Default, Clone, Copy)]
 pub struct FramePaintStats {
     pub texture_apply_secs: f64,
@@ -57,6 +58,7 @@ impl VitaSurface {
             egui_painter: SdlEguiPainter::default(),
         })
     }
+    #[allow(dead_code)]
     pub fn window(&self) -> &Window {
         self.canvas.window()
     }

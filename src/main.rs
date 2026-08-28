@@ -17,6 +17,7 @@ mod cache_manager;
 mod collections;
 mod config;
 mod ime;
+mod i18n;
 mod input;
 mod licensing;
 mod logger;

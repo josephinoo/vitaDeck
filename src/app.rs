@@ -1,6 +1,7 @@
 use crate::artwork::{self, ArtJob, ArtResult};
 use crate::collections::Collections;
 use crate::input::{AppCommand, InputCommand};
+use crate::i18n::{Locale, Localizer};
 use crate::net;
 use crate::recent::RecentlyPlayed;
 use crate::scanner::{
@@ -12,13 +13,14 @@ use crate::textures::TextureCache;
 use crate::ui::{card_row_stride, Mode, FOOTER_H, GRID_COLS, HEADER_H, SCREEN_H, SCREEN_W};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc, Mutex};
 
 const SCROLL_LERP: f32 = 0.22;
 
 const MAX_ART_JOBS_IN_FLIGHT: usize = 3;
 
-const STORE_ART_JOBS_IN_FLIGHT: usize = 2;
+const STORE_ART_JOBS_IN_FLIGHT: usize = 4;
+const ART_DOWNLOAD_WORKERS: usize = 4;
 
 const PRELOAD_MAX_ART_JOBS_IN_FLIGHT: usize = 3;
 
@@ -29,6 +31,8 @@ const ART_LOOKAHEAD: usize = 10;
 const STORE_SHOT_BUDGET: usize = 2;
 const STORE_SHOT_KEEP_RADIUS: usize = 2;
 const MEMORY_POLL_FRAMES: u64 = 30;
+const MAX_ART_RESULTS_PER_FRAME: usize = 2;
+const MAX_LOCAL_ART_RESULTS_PER_FRAME: usize = 2;
 
 const SYSTEM_TABS: [(&str, Option<System>); 4] = [
     ("ALL", None),
@@ -52,6 +56,26 @@ struct KnownArt {
     screenshot_url: Option<String>,
     logo_url: Option<String>,
     music_url: Option<String>,
+}
+
+struct LocalArtRequest {
+    title_id: String,
+    art_key: String,
+    system: System,
+    cover: bool,
+    hero: bool,
+    logo: bool,
+}
+
+struct LocalArtResult {
+    title_id: String,
+    art_key: String,
+    cover: Option<ImageBytes>,
+    hero: Option<ImageBytes>,
+    logo: Option<ImageBytes>,
+    cover_requested: bool,
+    hero_requested: bool,
+    logo_requested: bool,
 }
 
 #[derive(Clone)]
@@ -109,8 +133,9 @@ pub struct App {
     pub search_active: bool,
     pub ime: crate::ime::ImeDialog,
     pub launch_notice: Option<(String, String)>,
-    local_art_tx: mpsc::Sender<(String, Option<ImageBytes>, Option<ImageBytes>, Option<ImageBytes>)>,
-    local_art_rx: mpsc::Receiver<(String, Option<ImageBytes>, Option<ImageBytes>, Option<ImageBytes>)>,
+    local_art_tx: mpsc::Sender<LocalArtRequest>,
+    local_art_rx: mpsc::Receiver<LocalArtResult>,
+    local_art_pending: HashSet<String>,
 
     preload_pending: std::collections::HashSet<String>,
     preload_total: usize,
@@ -121,6 +146,7 @@ pub struct App {
     hero_lookup_tx: mpsc::Sender<(String, Vec<String>)>,
 
     pub config: crate::config::Config,
+    pub i18n: Localizer,
     pub cache_stats: crate::cache_manager::CacheStats,
     pub settings_selected: usize,
     tab_before_settings: usize,
@@ -170,6 +196,7 @@ impl App {
         let collections = Collections::load();
         let recent = RecentlyPlayed::load();
         let config = crate::config::Config::load();
+        let i18n = Localizer::new(config.locale);
         crate::net::set_client_id(config.client_id.clone());
         let cache_stats = crate::cache_manager::compute_cache_stats(&games);
         let store = crate::store::StoreManager::new();
@@ -179,25 +206,50 @@ impl App {
                 known_art.insert(title_id.clone(), store_known_art(item));
             }
         }
-        let tabs = build_tabs(&collections);
+        let tabs = build_tabs(&collections, &i18n);
         let visible = filter_games(&games, &store_games, &collections, &recent, 0, "");
         crate::logger::log("App::new: collections and config OK");
 
         let (request_tx, done_rx) = if net_ready {
             let (request_tx, request_rx) = mpsc::channel::<ArtJob>();
             let (done_tx, done_rx) = mpsc::channel::<ArtResult>();
-            std::thread::spawn(move || {
-                while let Ok(job) = request_rx.recv() {
-
+            let request_rx = Arc::new(Mutex::new(request_rx));
+            for _ in 0..ART_DOWNLOAD_WORKERS {
+                let request_rx = Arc::clone(&request_rx);
+                let done_tx = done_tx.clone();
+                std::thread::spawn(move || loop {
+                    let job = match request_rx.lock() {
+                        Ok(rx) => rx.recv(),
+                        Err(_) => return,
+                    };
+                    let Ok(job) = job else { return };
                     artwork::resolve(job, &done_tx);
-                }
-            });
+                });
+            }
             (Some(request_tx), Some(done_rx))
         } else {
             (None, None)
         };
 
-        let (local_art_tx, local_art_rx) = mpsc::channel();
+        let (local_art_tx, local_art_request_rx) = mpsc::channel::<LocalArtRequest>();
+        let (local_art_result_tx, local_art_rx) = mpsc::channel::<LocalArtResult>();
+        std::thread::spawn(move || {
+            while let Ok(request) = local_art_request_rx.recv() {
+                let cover = request.cover.then(|| load_cached_cover(request.system, &request.art_key)).flatten();
+                let hero = request.hero.then(|| load_cached_hero(request.system, &request.art_key)).flatten();
+                let logo = request.logo.then(|| load_cached_logo(request.system, &request.art_key)).flatten();
+                let _ = local_art_result_tx.send(LocalArtResult {
+                    title_id: request.title_id,
+                    art_key: request.art_key,
+                    cover,
+                    hero,
+                    logo,
+                    cover_requested: request.cover,
+                    hero_requested: request.hero,
+                    logo_requested: request.logo,
+                });
+            }
+        });
         let (shot_tx, shot_req_rx) = mpsc::channel::<(String, i32, String)>();
         let (shot_done_tx, shot_rx) = mpsc::channel();
         std::thread::spawn(move || {
@@ -249,6 +301,7 @@ impl App {
             launch_notice: None,
             local_art_tx,
             local_art_rx,
+            local_art_pending: HashSet::new(),
             preload_pending: std::collections::HashSet::new(),
             preload_total: 0,
             store_detail: None,
@@ -257,6 +310,7 @@ impl App {
             hero_lookup_rx: Some(hero_lookup_rx),
             hero_lookup_tx,
             config,
+            i18n,
             cache_stats,
             settings_selected: 0,
             tab_before_settings: 0,
@@ -270,8 +324,25 @@ impl App {
     }
 
     pub fn is_loading(&self) -> bool {
-        (self.games.is_empty() && (self.scan_rx.is_some() || self.lookup_rx.is_some()))
-            || !self.preload_pending.is_empty()
+        self.games.is_empty() && (self.scan_rx.is_some() || self.lookup_rx.is_some())
+    }
+
+    pub fn text(&self, key: &str) -> &str {
+        self.i18n.text(key)
+    }
+
+    pub fn locale_name(&self, locale: Locale) -> &str {
+        self.text(match locale {
+            Locale::EnUs => "language-name-en-US",
+            Locale::EsEs => "language-name-es-ES",
+            Locale::PtBr => "language-name-pt-BR",
+            Locale::FrFr => "language-name-fr-FR",
+            Locale::ItIt => "language-name-it-IT",
+        })
+    }
+
+    pub fn budget_label(&self) -> &str {
+        self.text(self.config.budget_label())
     }
 
     pub fn preload_progress(&self) -> Option<(usize, usize)> {
@@ -343,7 +414,7 @@ impl App {
         if !self.net_ready {
             return;
         }
-        let preloading = !self.preload_pending.is_empty();
+        let preloading = !self.is_store_tab() && !self.preload_pending.is_empty();
         if self.art_jobs_in_flight >= self.art_jobs_budget() {
             return;
         }
@@ -562,6 +633,19 @@ impl App {
                 if list_changed || self.games.is_empty() {
                     self.games = scanned_games;
                     self.refilter_visible();
+                } else {
+                    // The lightweight manifest can be older than the image files.
+                    // Keep the live list, but refresh its cache flags from the scan so
+                    // the artwork preloader does not fetch files already on disk.
+                    for (game, scanned) in self.games.iter_mut().zip(scanned_games.iter()) {
+                        game.has_box_art = scanned.has_box_art;
+                        game.has_hero = scanned.has_hero;
+                        game.has_logo = scanned.has_logo;
+                        game.music_resolved = scanned.music_resolved;
+                        game.music_path = scanned.music_path.clone();
+                        game.has_bubble = scanned.has_bubble;
+                        game.file_path = scanned.file_path.clone();
+                    }
                 }
 
                 crate::cache_manager::clean_orphaned_cache(&self.games);
@@ -616,10 +700,9 @@ impl App {
                         .iter()
                         .filter(|g| {
                             let Some(known) = known_art.get(&g.art_key) else { return false };
-                            (known.cover_url.is_some() && !g.has_box_art)
-                                || (known.screenshot_url.is_some() && !g.has_hero)
-                                || (known.logo_url.is_some() && !g.has_logo)
-                                || (known.music_url.is_some() && !g.music_resolved)
+                (known.cover_url.is_some() && !g.has_box_art)
+                    || (known.screenshot_url.is_some() && !g.has_hero)
+                    || (known.logo_url.is_some() && !g.has_logo)
                         })
                         .map(|g| g.title_id.clone())
                         .collect();
@@ -704,7 +787,8 @@ impl App {
         self.pump_art_queue();
 
         if let Some(rx) = &self.done_rx {
-            while let Ok(result) = rx.try_recv() {
+            for _ in 0..MAX_ART_RESULTS_PER_FRAME {
+                let Ok(result) = rx.try_recv() else { break };
 
                 let ArtResult {
                     title_id,
@@ -846,17 +930,25 @@ impl App {
 
         let selected_index = self.visible.get(self.selected).copied();
 
-        while let Ok((art_key, hero, logo, cover)) = self.local_art_rx.try_recv() {
-            if let Some(game) = self.games.iter_mut().find(|g| g.art_key == art_key) {
-                if let Some(h) = hero {
+        for _ in 0..MAX_LOCAL_ART_RESULTS_PER_FRAME {
+            let Ok(result) = self.local_art_rx.try_recv() else { break };
+            self.local_art_pending.retain(|key| !key.starts_with(&format!("{}:", result.title_id)));
+            if let Some(game) = self.games.iter_mut().find(|g| g.art_key == result.art_key) {
+                if let Some(h) = result.hero {
                     game.hero_bytes = Some(h);
                 }
-                if let Some(l) = logo {
+                if let Some(l) = result.logo {
                     game.logo_bytes = Some(l);
                 }
-                if let Some(c) = cover {
+                if let Some(c) = result.cover.clone() {
                     game.cover_bytes = Some(c);
                 }
+                if result.cover_requested && game.cover_bytes.is_none() { game.has_box_art = false; }
+                if result.hero_requested && game.hero_bytes.is_none() { game.has_hero = false; }
+                if result.logo_requested && game.logo_bytes.is_none() { game.has_logo = false; }
+            }
+            if let Some(game) = self.store_games.iter_mut().find(|g| g.art_key == result.art_key) {
+                if let Some(c) = result.cover { game.cover_bytes = Some(c); }
             }
         }
 
@@ -884,51 +976,26 @@ impl App {
                     .unwrap_or((false, false));
 
                 if let (Some(system), Some(art_key), Some(title_id)) = (system, art_key, title_id) {
-                    let hero = if needs_hero { load_cached_hero(system, &art_key) } else { None };
-                    let logo = if needs_logo { load_cached_logo(system, &art_key) } else { None };
-
-                    if let Some(game) = self.games.get_mut(selected_index) {
-                        if needs_hero && hero.is_none() {
-                            game.has_hero = false;
-                            self.art_state.remove(&title_id);
-                        }
-                        if needs_logo && logo.is_none() {
-                            game.has_logo = false;
-                            self.art_state.remove(&title_id);
-                        }
-                    }
-
-                    if hero.is_some() || logo.is_some() {
-                        let _ = self.local_art_tx.send((art_key, hero, logo, None));
-                    }
+                    self.request_local_art(title_id, art_key, system, false, needs_hero, needs_logo);
                 }
             }
         }
 
+        let keep = self.cover_keep_set();
         if !self.is_store_tab() {
-            for index in self.cover_keep_set() {
-                if let Some(game) = self.games.get_mut(index) {
-                    if game.cover_bytes.is_none() && game.has_box_art {
-                        game.cover_bytes = load_cached_cover(game.system, &game.art_key);
-                        if game.cover_bytes.is_none() {
-                            game.has_box_art = false;
-                        }
-                    }
+            for index in keep {
+                let game = self.games.get(index).filter(|g| g.cover_bytes.is_none() && g.has_box_art).cloned();
+                if let Some(game) = game {
+                    self.request_local_art(game.title_id, game.art_key, game.system, true, false, false);
+                    break;
                 }
             }
         } else {
-            for index in self.cover_keep_set() {
-                let Some(game) = self.store_games.get(index) else { continue };
-                if game.cover_bytes.is_some() || !self.is_title_installed(&game.title_id) {
-                    continue;
-                }
-                let (system, art_key, title_id) = (game.system, game.art_key.clone(), game.title_id.clone());
-                let local = load_cached_cover(system, &art_key)
-                    .or_else(|| crate::scanner::load_vita_cover(&title_id).0);
-                if let Some(bytes) = local {
-                    if let Some(game) = self.store_games.get_mut(index) {
-                        game.cover_bytes = Some(bytes);
-                    }
+            for index in keep {
+                let game = self.store_games.get(index).filter(|g| g.cover_bytes.is_none()).cloned();
+                if let Some(game) = game {
+                    self.request_local_art(game.title_id, game.art_key, game.system, true, false, false);
+                    break;
                 }
             }
         }
@@ -1024,6 +1091,24 @@ impl App {
             }
         }
         keep
+    }
+
+    fn request_local_art(&mut self, title_id: String, art_key: String, system: System, cover: bool, hero: bool, logo: bool) {
+        let key = format!("{}:{}:{}:{}", title_id, cover as u8, hero as u8, logo as u8);
+        if !self.local_art_pending.insert(key) {
+            return;
+        }
+        let request = LocalArtRequest {
+            title_id,
+            art_key,
+            system,
+            cover,
+            hero,
+            logo,
+        };
+        if self.local_art_tx.send(request).is_err() {
+            self.local_art_pending.clear();
+        }
     }
 
     fn drop_store_cover(&mut self, index: usize) {
@@ -1127,11 +1212,11 @@ impl App {
                 } else {
                     self.audio.play(SoundEffect::OpenModal);
                     let title = if self.is_store_tab() {
-                        "Search the store"
+                        self.text("search-store").to_owned()
                     } else {
-                        "Search games"
+                        self.text("search-games").to_owned()
                     };
-                    self.ime.open(title, &self.search_query, 64);
+                    self.ime.open(&title, &self.search_query, 64);
                     self.search_active = true;
                 }
             }
@@ -1164,10 +1249,11 @@ impl App {
                     match self.settings_selected {
                         0 => self.trigger_rescan(),
                         1 => self.handle_command(AppCommand::ToggleDownloadBgm),
-                        2 => self.handle_command(AppCommand::CycleCacheBudget),
-                        3 => self.handle_command(AppCommand::CleanOrphanCache),
-                        4 => self.handle_command(AppCommand::PurgeMusicCache),
-                        5 => self.handle_command(AppCommand::PurgeAllCache),
+                        2 => self.handle_command(AppCommand::CycleLanguage),
+                        3 => self.handle_command(AppCommand::CycleCacheBudget),
+                        4 => self.handle_command(AppCommand::CleanOrphanCache),
+                        5 => self.handle_command(AppCommand::PurgeMusicCache),
+                        6 => self.handle_command(AppCommand::PurgeAllCache),
                         _ => {}
                     }
                 } else if self.mode == Mode::CollectionPicker {
@@ -1195,9 +1281,18 @@ impl App {
                     self.audio.set_music(None);
                     self.music_selected = None;
                 }
-                self.cache_notice = Some(format!(
-                    "Background music: {}",
-                    if self.config.download_bgm { "Enabled" } else { "Disabled" }
+                self.cache_notice = Some(self.i18n.format_one(
+                    "notice-bgm", "status", self.text(if self.config.download_bgm { "status-enabled" } else { "status-disabled" }).to_owned(),
+                ));
+            }
+            AppCommand::CycleLanguage => {
+                self.audio.play(SoundEffect::Confirm);
+                self.config.locale = self.config.locale.next();
+                self.config.save();
+                self.i18n = Localizer::new(self.config.locale);
+                self.tabs = build_tabs(&self.collections, &self.i18n);
+                self.cache_notice = Some(self.i18n.format_one(
+                    "notice-language", "language", self.locale_name(self.config.locale).to_owned(),
                 ));
             }
             AppCommand::CycleCacheBudget => {
@@ -1205,21 +1300,19 @@ impl App {
                 self.config.next_budget_option();
                 let freed = crate::cache_manager::enforce_cache_budget(&self.games, self.config.cache_budget_mb);
                 self.cache_stats = crate::cache_manager::compute_cache_stats(&self.games);
-                self.cache_notice = Some(format!(
-                    "Cache limit: {} ({} freed)",
-                    self.config.budget_label(),
-                    crate::cache_manager::format_bytes(freed)
-                ));
+                let mut args = fluent_bundle::FluentArgs::new();
+                args.set("limit", self.budget_label().to_owned());
+                args.set("freed", crate::cache_manager::format_bytes(freed));
+                self.cache_notice = Some(self.i18n.format("notice-cache", Some(&args)));
             }
             AppCommand::CleanOrphanCache => {
                 self.audio.play(SoundEffect::Confirm);
                 let (count, freed) = crate::cache_manager::clean_orphaned_cache(&self.games);
                 self.cache_stats = crate::cache_manager::compute_cache_stats(&self.games);
-                self.cache_notice = Some(format!(
-                    "Orphans removed: {} files ({})",
-                    count,
-                    crate::cache_manager::format_bytes(freed)
-                ));
+                let mut args = fluent_bundle::FluentArgs::new();
+                args.set("count", count as i64);
+                args.set("freed", crate::cache_manager::format_bytes(freed));
+                self.cache_notice = Some(self.i18n.format("notice-orphans", Some(&args)));
             }
             AppCommand::PurgeMusicCache => {
                 self.audio.play(SoundEffect::Confirm);
@@ -1231,11 +1324,10 @@ impl App {
                 self.music_requested.clear();
                 self.music_retry_after.clear();
                 self.audio.set_music(None);
-                self.cache_notice = Some(format!(
-                    "Music purged: {} files ({})",
-                    count,
-                    crate::cache_manager::format_bytes(freed)
-                ));
+                let mut args = fluent_bundle::FluentArgs::new();
+                args.set("count", count as i64);
+                args.set("freed", crate::cache_manager::format_bytes(freed));
+                self.cache_notice = Some(self.i18n.format("notice-music-purged", Some(&args)));
             }
             AppCommand::PurgeAllCache => {
                 self.audio.play(SoundEffect::Confirm);
@@ -1251,11 +1343,10 @@ impl App {
                 self.music_requested.clear();
                 self.music_retry_after.clear();
                 self.audio.set_music(None);
-                self.cache_notice = Some(format!(
-                    "All cache purged: {} files ({})",
-                    count,
-                    crate::cache_manager::format_bytes(freed)
-                ));
+                let mut args = fluent_bundle::FluentArgs::new();
+                args.set("count", count as i64);
+                args.set("freed", crate::cache_manager::format_bytes(freed));
+                self.cache_notice = Some(self.i18n.format("notice-cache-purged", Some(&args)));
             }
             AppCommand::TogglePickerRow(index) => {
                 self.audio.play(SoundEffect::Confirm);
@@ -1285,7 +1376,7 @@ impl App {
                 } else if self.mode == Mode::CollectionPicker {
                     self.audio.play(SoundEffect::CloseModal);
                     self.mode = Mode::Browse;
-                    self.tabs = build_tabs(&self.collections);
+                    self.tabs = build_tabs(&self.collections, &self.i18n);
                 } else if self.is_settings() {
                     self.audio.play(SoundEffect::CloseModal);
                     self.set_tab(self.tab_before_settings);
@@ -1360,7 +1451,7 @@ impl App {
                 }
                 InputCommand::MoveDown => {
                     if self.is_settings() {
-                        if self.settings_selected < 5 {
+                        if self.settings_selected < 6 {
                             self.settings_selected += 1;
                             self.audio.play(SoundEffect::Navigate);
                         }
@@ -1602,14 +1693,18 @@ impl App {
         match self.store.download_and_install(title_id) {
             Ok(()) => {
                 self.audio.play(crate::audio::SoundEffect::LaunchGame);
+                let mut args = fluent_bundle::FluentArgs::new();
+                args.set("title", title);
                 self.launch_notice = Some((
                     title_id.to_string(),
-                    format!("Enqueued download for '{title}'. Added to LiveArea downloads!"),
+                    self.i18n.format("notice-download-enqueued", Some(&args)),
                 ));
             }
             Err(e) => {
                 self.audio.play(crate::audio::SoundEffect::CloseModal);
-                self.launch_notice = Some((title_id.to_string(), format!("Download error: {e}")));
+                let mut args = fluent_bundle::FluentArgs::new();
+                args.set("error", e.to_string());
+                self.launch_notice = Some((title_id.to_string(), self.i18n.format("error-download", Some(&args))));
             }
         }
     }
@@ -1811,7 +1906,7 @@ impl App {
                 let Some(file_path) = game.file_path.clone() else {
                     self.launch_notice = Some((
                         game.title_id.clone(),
-                        "No se encontró la ruta local del juego PSP/PS1".to_string(),
+                        self.text("error-launch").to_string(),
                     ));
                     return;
                 };
@@ -1839,7 +1934,7 @@ impl App {
                     ));
                     self.launch_notice = Some((
                         game.title_id.clone(),
-                        "No se pudo preparar el launcher de Adrenaline (revisa PSPEMUCFW/PSPEMU001)".to_string(),
+                        self.text("error-launch").to_string(),
                     ));
                     return;
                 }
@@ -1878,7 +1973,7 @@ impl App {
             }
             self.launch_notice = Some((
                 game.title_id.clone(),
-                "No se pudo lanzar el juego (falló AppMgr en todos los launchers)".to_string(),
+                self.text("error-launch").to_string(),
             ));
         }
 
@@ -1931,13 +2026,22 @@ impl App {
     }
 }
 
-fn build_tabs(collections: &Collections) -> Vec<String> {
+fn build_tabs(collections: &Collections, i18n: &Localizer) -> Vec<String> {
     SYSTEM_TABS
         .iter()
-        .map(|(name, _)| name.to_string())
-        .chain(std::iter::once("RECENTLY PLAYED".to_string()))
-        .chain(std::iter::once("STORE".to_string()))
-        .chain(collections.items.iter().map(|c| c.name.to_uppercase()))
+        .map(|(name, _)| match *name {
+            "ALL" => i18n.text("tab-all").to_owned(),
+            "PS VITA" => "PS VITA".to_owned(),
+            "PSP" => "PSP".to_owned(),
+            _ => "PS1".to_owned(),
+        })
+        .chain(std::iter::once(i18n.text("tab-recent").to_owned()))
+        .chain(std::iter::once(i18n.text("tab-store").to_owned()))
+        .chain(collections.items.iter().map(|c| {
+            if c.name.eq_ignore_ascii_case("Favorites") || c.name.eq_ignore_ascii_case("Favoritos") {
+                i18n.text("tab-favorites").to_owned()
+            } else { c.name.to_uppercase() }
+        }))
         .collect()
 }
 

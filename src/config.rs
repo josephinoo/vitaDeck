@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::io::Read;
+use crate::i18n::Locale;
 
 pub const CONFIG_FILE: &str = "ux0:data/VitaDeck/config.json";
 
@@ -14,6 +15,8 @@ pub struct Config {
     pub cache_budget_mb: u32,
     #[serde(default)]
     pub client_id: String,
+    #[serde(default)]
+    pub locale: Locale,
 }
 
 fn default_download_bgm() -> bool {
@@ -30,6 +33,7 @@ impl Default for Config {
             download_bgm: default_download_bgm(),
             cache_budget_mb: default_cache_budget_mb(),
             client_id: String::new(),
+            locale: Locale::default(),
         }
     }
 }
@@ -85,8 +89,8 @@ impl Config {
             100 => "100 MB",
             150 => "150 MB",
             300 => "300 MB",
-            0 => "Unlimited",
-            _ => "Custom",
+            0 => "budget-unlimited",
+            _ => "budget-custom",
         }
     }
 
