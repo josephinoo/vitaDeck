@@ -112,10 +112,14 @@ pub fn run(mut app: App) -> Result<()> {
                 | sdl2::event::Event::AppDidEnterBackground { .. } => {
                     #[cfg(target_os = "vita")]
                     unsafe {
+                        crate::session::finish_cleanly();
                         vitasdk_sys::sceKernelExitProcess(0);
                     }
                     #[cfg(not(target_os = "vita"))]
-                    return Ok(());
+                    {
+                        crate::session::finish_cleanly();
+                        return Ok(());
+                    }
                 }
                 sdl2::event::Event::ControllerDeviceAdded { .. } if controller.is_none() => {
                     controller = open_first_controller(&controllers);

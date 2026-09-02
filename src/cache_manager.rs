@@ -1,4 +1,4 @@
-use crate::scanner::Game;
+use crate::scanner::{Game, System};
 use std::collections::HashSet;
 use std::fs;
 use std::path::PathBuf;
@@ -109,7 +109,10 @@ pub fn clean_orphaned_cache(games: &[Game]) -> (usize, u64) {
     let mut removed_count = 0;
     let mut bytes_freed = 0;
 
-    let dirs = [COVERS_DIR, HERO_DIR, LOGO_DIR, MUSIC_DIR];
+    // Covers also contain on-demand Store thumbnails. They need not match an
+    // installed title, so the normal LRU budget (not orphan cleanup) owns
+    // their eviction.
+    let dirs = [HERO_DIR, LOGO_DIR, MUSIC_DIR];
     for base in dirs {
         for file in list_category_files(base) {
             if !valid_keys.contains(&file.stem_lower) {
@@ -153,6 +156,31 @@ pub fn purge_all_cache() -> (usize, u64) {
     }
 
     (removed_count, bytes_freed)
+}
+
+pub fn remove_game_art(system: System, art_key: &str) -> usize {
+    let image_bases = [
+        crate::scanner::cover_cache_path(system, art_key),
+        crate::scanner::hero_cache_path(system, art_key),
+        crate::scanner::logo_cache_path(system, art_key),
+    ];
+    let mut removed = 0;
+    for base in image_bases {
+        for ext in ["png", "jpg"] {
+            if fs::remove_file(format!("{base}.{ext}")).is_ok() {
+                removed += 1;
+            }
+        }
+    }
+    if fs::remove_file(format!(
+        "{}.mp3",
+        crate::scanner::music_cache_path(system, art_key)
+    ))
+    .is_ok()
+    {
+        removed += 1;
+    }
+    removed
 }
 
 pub fn enforce_cache_budget(games: &[Game], budget_mb: u32) -> u64 {
@@ -236,4 +264,3 @@ mod tests {
         assert!(!keys.contains("random_game"));
     }
 }
-

@@ -14,13 +14,30 @@ const MAX_REDIRECTS: u32 = 10;
 const USER_AGENT: &str = "Mozilla/5.0 (PlayStation Vita 3.60) AppleWebKit/537.73 (KHTML, like Gecko) VitaDeck/1.0";
 
 static CLIENT_ID: OnceLock<String> = OnceLock::new();
+const FALLBACK_CLIENT_ID: &str = "vitadeck-client-v1";
 
 pub fn set_client_id(id: String) {
-    let _ = CLIENT_ID.set(id);
+    // VitaForge uses this value to identify a VitaDeck installation. Never
+    // send an empty header: a few proxies turn that into a missing header.
+    let id = id.trim();
+    let id = if id.is_empty() { FALLBACK_CLIENT_ID } else { id };
+    if CLIENT_ID.set(id.to_owned()).is_ok() {
+        crate::logger::log(&format!("net: client id configured ({} bytes)", id.len()));
+    }
 }
 
 fn client_id() -> &'static str {
-    CLIENT_ID.get().map(String::as_str).unwrap_or("vitadeck-unset")
+    CLIENT_ID.get().map(String::as_str).unwrap_or(FALLBACK_CLIENT_ID)
+}
+
+fn request_headers(host: &str, path: &str, method: &str, accept: &str) -> String {
+    // VitaForge's documented installation identifier. Keep this request
+    // exactly aligned with the API contract; adding a second variant can make
+    // strict edge proxies route the request differently.
+    format!(
+        "{method} {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: {USER_AGENT}\r\nX-Client-ID: {}\r\nAccept: {accept}\r\nConnection: close\r\n\r\n",
+        client_id(),
+    )
 }
 
 fn tls_config() -> Arc<rustls::ClientConfig> {
@@ -111,10 +128,7 @@ fn request_once(
         tcp.set_write_timeout(Some(CONNECT_TIMEOUT)).ok();
     }
 
-    let request = format!(
-        "{} {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: {}\r\nX-Client-ID: {}\r\nAccept: application/json, */*\r\nConnection: close\r\n\r\n",
-        method, url.path, url.host, USER_AGENT, client_id()
-    );
+    let request = request_headers(&url.host, &url.path, method, "application/json, */*");
 
     let mut reader: Box<dyn Read> = if url.https {
         let server_name = rustls_pki_types::ServerName::try_from(url.host.clone())
@@ -413,10 +427,7 @@ pub fn download_to_file(url: &str, path: &str, max_bytes: usize) -> Result<(), S
             tcp.set_write_timeout(Some(CONNECT_TIMEOUT)).ok();
         }
 
-        let request = format!(
-            "GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: {}\r\nX-Client-ID: {}\r\nAccept: */*\r\nConnection: close\r\n\r\n",
-            parsed.path, parsed.host, USER_AGENT, client_id()
-        );
+        let request = request_headers(&parsed.host, &parsed.path, "GET", "*/*");
 
         let mut reader: Box<dyn Read> = if parsed.https {
             let server_name = rustls_pki_types::ServerName::try_from(parsed.host.clone())

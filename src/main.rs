@@ -25,7 +25,9 @@ mod mp3;
 mod net;
 mod recent;
 mod scanner;
+mod session;
 mod shell;
+mod stats;
 mod store;
 mod textures;
 mod ui;
@@ -40,16 +42,24 @@ fn install_panic_hook() {
         if let Ok(mut file) =
             std::fs::OpenOptions::new().create(true).append(true).open("ux0:data/VitaDeck/panic.log")
         {
-            let _ = writeln!(file, "=== panic ===\n{info}");
+            let _ = writeln!(
+                file,
+                "=== panic ===\n{info}\n{}",
+                crate::logger::current_health_context()
+            );
         }
     }));
 }
 
 fn main() -> anyhow::Result<()> {
     install_panic_hook();
+    let recovered_from_crash = session::begin();
+    if recovered_from_crash {
+        logger::log("previous VitaDeck session ended unexpectedly; restoring normal media loading");
+    }
     logger::log("=== VitaDeck starting ===");
 
-    let app = App::new();
+    let app = App::new(recovered_from_crash);
     logger::log("App::new completed successfully");
     shell::run(app)
 }

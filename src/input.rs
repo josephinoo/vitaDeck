@@ -19,20 +19,34 @@ pub enum AppCommand {
     Confirm,
     Back,
     OpenCollectionPicker,
+    OpenGameOptions,
+    RenameSelectedGame,
+    ToggleHideSelectedGame,
+    CreateCollection,
     RemoveFromCollection,
     ToggleSearch,
+    SearchStore,
+    OpenStoreFilters,
+    ClearStoreRegions,
+    ToggleStoreRegion(usize),
     Rescan,
     ToggleDownloadBgm,
     CycleLanguage,
     CycleCacheBudget,
+    CycleLibrarySort,
+    CycleLibraryView,
     CleanOrphanCache,
     PurgeMusicCache,
     PurgeAllCache,
     Quit,
     OpenSettings,
+    OpenScanFolders,
+    AddCustomScanFolder,
+    RemoveCustomScanFolder(usize),
     SelectVisibleSlot(usize),
     SelectTab(usize),
     TogglePickerRow(usize),
+    ToggleScanFolder(usize),
     SetDownloadChoice(usize),
     ConfirmDownload(bool),
 }
@@ -55,6 +69,9 @@ pub fn map_controller_button_event(event: &Event) -> Option<AppCommand> {
         Button::Y => AppCommand::OpenCollectionPicker,
         Button::X => AppCommand::RemoveFromCollection,
         Button::Back => AppCommand::ToggleSearch,
+        Button::RightStick => AppCommand::CycleLibrarySort,
+        Button::LeftStick => AppCommand::CycleLibraryView,
+        Button::Guide => AppCommand::OpenGameOptions,
         Button::Start => AppCommand::OpenSettings,
         Button::LeftShoulder => AppCommand::TabPrev,
         Button::RightShoulder => AppCommand::TabNext,
@@ -109,7 +126,7 @@ pub fn register_vita_controller_mapping(sdl: &sdl2::Sdl) -> Result<(), String> {
     let mapping = format!(
         "{guid},PSVita Controller,\
          a:b2,b:b1,x:b3,y:b0,\
-         back:b10,start:b11,\
+         back:b10,start:b11,guide:b12,\
          leftshoulder:b4,rightshoulder:b5,\
          leftstick:b14,rightstick:b15,\
          dpup:b8,dpdown:b6,dpleft:b7,dpright:b9,\

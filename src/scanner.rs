@@ -159,7 +159,7 @@ fn find_music(dir: &str) -> Option<String> {
     sce_file_exists(&path).then_some(path)
 }
 
-pub fn scan_installed_games() -> (Vec<Game>, Vec<String>) {
+pub fn scan_installed_games(disabled_dirs: &[String], custom_dirs: &[String]) -> (Vec<Game>, Vec<String>) {
     let mut games = Vec::new();
     let mut log = Vec::new();
 
@@ -172,7 +172,7 @@ pub fn scan_installed_games() -> (Vec<Game>, Vec<String>) {
     }
 
     ensure_overrides_file();
-    let pspemu = index_pspemu(&mut log);
+    let pspemu = index_pspemu(&mut log, disabled_dirs, custom_dirs);
     let overrides = load_overrides();
     let matched = scan_vita_apps(&mut games, &mut log, &pspemu, &overrides);
     emit_unbubbled_pspemu_games(&mut games, &mut log, &pspemu, &matched);
@@ -209,7 +209,140 @@ fn is_junk_name(name: &str) -> bool {
         || base.eq_ignore_ascii_case("desktop.ini")
 }
 
-fn index_pspemu(log: &mut Vec<String>) -> PspemuIndex {
+/// Discover immediate subdirectories of `dir` that are "category" folders —
+/// i.e. directories that don't themselves look like a PSP game dir (no direct
+/// EBOOT.PBP). Used both for recursion and for the settings folder picker.
+fn category_subdirs(dir: &str) -> Vec<String> {
+    let Ok(names) = list_dir(dir) else { return Vec::new() };
+    let mut out = Vec::new();
+    for name in names {
+        if is_junk_name(&name) {
+            continue;
+        }
+        let child = format!("{}/{}", dir, name);
+        if !is_dir(&child) {
+            continue;
+        }
+        if sce_file_exists(&format!("{}/EBOOT.PBP", child)) {
+            continue;
+        }
+        out.push(child);
+    }
+    out.sort();
+    out
+}
+
+fn category_subdirs_recursive(root: &str, max_depth: usize) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut frontier = vec![(root.to_string(), 0usize)];
+    while let Some((dir, depth)) = frontier.pop() {
+        if depth >= max_depth {
+            continue;
+        }
+        for child in category_subdirs(&dir) {
+            frontier.push((child.clone(), depth + 1));
+            found.push(child);
+        }
+    }
+    found.sort();
+    found.dedup();
+    found
+}
+
+fn is_dir_disabled(dir: &str, disabled_dirs: &[String]) -> bool {
+    disabled_dirs.iter().any(|d| d == dir)
+}
+
+fn index_pbp_dir(
+    game_root: &str,
+    entries: &mut HashMap<String, PspemuEntry>,
+    has_pbp: &mut HashSet<String>,
+    log: &mut Vec<String>,
+) {
+    let Ok(names) = list_dir(game_root) else { return };
+    log.push(format!("{} -> {} entries", game_root, names.len()));
+
+    for title_id in names {
+        if is_junk_name(&title_id) {
+            continue;
+        }
+        let pbp = format!("{}/{}/EBOOT.PBP", game_root, title_id);
+        if !sce_file_exists(&pbp) {
+            continue;
+        }
+
+        let pbp_data = read_pbp_sections(&pbp);
+        let sfo_fields = pbp_data.as_ref().and_then(|d| {
+            parse_sfo_fields(&d.param_sfo, &["DISC_ID", "TITLE_ID", "CATEGORY", "TITLE", "STITLE"])
+        });
+
+        let system_hint = classify_pspemu(&title_id, sfo_fields.as_deref());
+        let art_key = art_key_from_sfo(sfo_fields.as_deref()).unwrap_or_else(|| {
+            sanitize_sony_title_id(&title_id).unwrap_or_else(|| title_id.clone())
+        });
+        let title = sfo_fields
+            .as_deref()
+            .and_then(|f| {
+                f.iter().find(|(k, v)| {
+                    (k == "TITLE" || k == "STITLE") && !v.trim().is_empty()
+                })
+            })
+            .map(|(_, v)| normalize_title(v))
+            .unwrap_or_else(|| title_id.clone());
+
+        let icon0 = pbp_data
+            .as_ref()
+            .filter(|d| !d.icon0.is_empty())
+            .map(|d| (true, d.icon0.clone()));
+
+        let source_dir = Some(format!("{}/{}", game_root, title_id));
+
+        has_pbp.insert(title_id.clone());
+        entries.insert(title_id, PspemuEntry { art_key, title, icon0, system_hint, source_dir, file_path: pbp });
+    }
+}
+
+fn index_iso_dir(
+    iso_root: &str,
+    entries: &mut HashMap<String, PspemuEntry>,
+    log: &mut Vec<String>,
+) {
+    let Ok(names) = list_dir(iso_root) else { return };
+    let mut count = 0;
+    for name in names {
+        if is_junk_name(&name) {
+            continue;
+        }
+        let lower = name.to_lowercase();
+        if !lower.ends_with(".iso") && !lower.ends_with(".cso") {
+            continue;
+        }
+        let title = clean_rom_name(&name);
+        if title.is_empty() {
+            continue;
+        }
+        let sanitized_id = sanitize_sony_title_id(&name).or_else(|| sanitize_sony_title_id(&title));
+        let art_key = sanitized_id.clone().unwrap_or_else(|| title.clone());
+        let stem = name.rsplit_once('.').map(|(stem, _)| stem.to_string()).unwrap_or_else(|| name.clone());
+        if is_junk_name(&stem) {
+            continue;
+        }
+
+        let iso_path = format!("{}/{}", iso_root, name);
+        entries.entry(stem).or_insert(PspemuEntry {
+            art_key,
+            title,
+            icon0: None,
+            system_hint: System::Psp,
+            source_dir: None,
+            file_path: iso_path,
+        });
+        count += 1;
+    }
+    log.push(format!("{} -> {} iso/cso entries", iso_root, count));
+}
+
+fn index_pspemu(log: &mut Vec<String>, disabled_dirs: &[String], custom_dirs: &[String]) -> PspemuIndex {
     let mut entries = HashMap::new();
     let mut has_pbp = HashSet::new();
 
@@ -220,84 +353,54 @@ fn index_pspemu(log: &mut Vec<String>) -> PspemuIndex {
         }
 
         let game_root = format!("{}:pspemu/PSP/GAME", part);
-        if let Ok(names) = list_dir(&game_root) {
-            log.push(format!("{} -> {} entries", game_root, names.len()));
-
-            for title_id in names {
-                if is_junk_name(&title_id) {
-                    continue;
-                }
-                let pbp = format!("{}/{}/EBOOT.PBP", game_root, title_id);
-                if !sce_file_exists(&pbp) {
-                    continue;
-                }
-
-                let pbp_data = read_pbp_sections(&pbp);
-                let sfo_fields = pbp_data.as_ref().and_then(|d| {
-                    parse_sfo_fields(&d.param_sfo, &["DISC_ID", "TITLE_ID", "CATEGORY", "TITLE", "STITLE"])
-                });
-
-                let system_hint = classify_pspemu(&title_id, sfo_fields.as_deref());
-                let art_key = art_key_from_sfo(sfo_fields.as_deref()).unwrap_or_else(|| {
-                    sanitize_sony_title_id(&title_id).unwrap_or_else(|| title_id.clone())
-                });
-                let title = sfo_fields
-                    .as_deref()
-                    .and_then(|f| {
-                        f.iter().find(|(k, v)| {
-                            (k == "TITLE" || k == "STITLE") && !v.trim().is_empty()
-                        })
-                    })
-                    .map(|(_, v)| v.clone())
-                    .unwrap_or_else(|| title_id.clone());
-
-                let icon0 = pbp_data
-                    .as_ref()
-                    .filter(|d| !d.icon0.is_empty())
-                    .map(|d| (true, d.icon0.clone()));
-
-                let source_dir = Some(format!("{}/{}", game_root, title_id));
-
-                has_pbp.insert(title_id.clone());
-                entries.insert(title_id, PspemuEntry { art_key, title, icon0, system_hint, source_dir, file_path: pbp });
+        index_pbp_dir(&game_root, &mut entries, &mut has_pbp, log);
+        for sub in category_subdirs_recursive(&game_root, 3) {
+            if is_dir_disabled(&sub, disabled_dirs) {
+                log.push(format!("{} -> skipped (disabled)", sub));
+                continue;
             }
+            index_pbp_dir(&sub, &mut entries, &mut has_pbp, log);
         }
 
         let iso_root = format!("{}:pspemu/ISO", part);
-        if let Ok(names) = list_dir(&iso_root) {
-            for name in names {
-                if is_junk_name(&name) {
-                    continue;
-                }
-                let lower = name.to_lowercase();
-                if !lower.ends_with(".iso") && !lower.ends_with(".cso") {
-                    continue;
-                }
-                let title = clean_rom_name(&name);
-                if title.is_empty() {
-                    continue;
-                }
-                let sanitized_id = sanitize_sony_title_id(&name).or_else(|| sanitize_sony_title_id(&title));
-                let art_key = sanitized_id.clone().unwrap_or_else(|| title.clone());
-                let stem = name.rsplit_once('.').map(|(stem, _)| stem.to_string()).unwrap_or_else(|| name.clone());
-                if is_junk_name(&stem) {
-                    continue;
-                }
-
-                let iso_path = format!("{}/{}", iso_root, name);
-                entries.entry(stem).or_insert(PspemuEntry {
-                    art_key,
-                    title,
-                    icon0: None,
-                    system_hint: System::Psp,
-                    source_dir: None,
-                    file_path: iso_path,
-                });
+        index_iso_dir(&iso_root, &mut entries, log);
+        for sub in category_subdirs_recursive(&iso_root, 3) {
+            if is_dir_disabled(&sub, disabled_dirs) {
+                log.push(format!("{} -> skipped (disabled)", sub));
+                continue;
             }
+            index_iso_dir(&sub, &mut entries, log);
         }
     }
 
+    for dir in custom_dirs {
+        if is_dir_disabled(dir, disabled_dirs) { continue; }
+        if !sce_file_exists(dir) {
+            log.push(format!("{} -> custom path unavailable", dir));
+            continue;
+        }
+        index_pbp_dir(dir, &mut entries, &mut has_pbp, log);
+        index_iso_dir(dir, &mut entries, log);
+    }
+
     PspemuIndex { entries, has_pbp }
+}
+
+/// Enumerate every category subfolder (depth 1) under the pspemu PSP/GAME and
+/// ISO roots across all partitions, for the settings folder picker.
+pub fn discover_scan_folders() -> Vec<String> {
+    let mut out = Vec::new();
+    for part in PSPEMU_PARTITIONS {
+        let pspemu_dir = format!("{}:pspemu", part);
+        if !sce_file_exists(&pspemu_dir) {
+            continue;
+        }
+        out.extend(category_subdirs_recursive(&format!("{}:pspemu/PSP/GAME", part), 3));
+        out.extend(category_subdirs_recursive(&format!("{}:pspemu/ISO", part), 3));
+    }
+    out.sort();
+    out.dedup();
+    out
 }
 
 fn ensure_overrides_file() {
@@ -553,18 +656,6 @@ fn emit_unbubbled_pspemu_games(
         let system = entry.system_hint;
         let art_key = entry.art_key.clone();
         let title = entry.title.clone();
-
-        let looks_like_id = sanitize_sony_title_id(key).is_some()
-            || sanitize_sony_title_id(&art_key).is_some();
-        let has_pbp_meta = entry.source_dir.is_some();
-        if !looks_like_id && !has_pbp_meta {
-            let cache_png = format!("{}.png", cover_cache_path(system, &art_key));
-            let cache_jpg = format!("{}.jpg", cover_cache_path(system, &art_key));
-            if !sce_file_exists(&cache_png) && !sce_file_exists(&cache_jpg) {
-                log.push(format!("SKIP unbubbled ISO without TitleID: {}", key));
-                continue;
-            }
-        }
 
         let cache_path_png = format!("{}.png", cover_cache_path(system, &art_key));
         let cache_path_jpg = format!("{}.jpg", cover_cache_path(system, &art_key));
@@ -920,6 +1011,23 @@ fn sce_file_exists(path: &str) -> bool {
     std::path::Path::new(path).exists()
 }
 
+#[cfg(target_os = "vita")]
+fn is_dir(path: &str) -> bool {
+    let Ok(c_path) = CString::new(path) else { return false };
+    unsafe {
+        let mut stat: SceIoStat = std::mem::zeroed();
+        if sceIoGetstat(c_path.as_ptr(), &mut stat) < 0 {
+            return false;
+        }
+        (stat.st_mode & vitasdk_sys::SCE_S_IFMT as i32) == vitasdk_sys::SCE_S_IFDIR as i32
+    }
+}
+
+#[cfg(not(target_os = "vita"))]
+fn is_dir(path: &str) -> bool {
+    std::path::Path::new(path).is_dir()
+}
+
 pub fn write_append_log(line: &str) {
     let _ = std::fs::create_dir_all("ux0:data/VitaDeck/");
     if let Ok(mut f) = File::options().create(true).append(true).open("ux0:data/VitaDeck/scan_log.txt") {
@@ -950,7 +1058,19 @@ fn parse_sfo_title(data: &[u8]) -> Option<String> {
     fields
         .into_iter()
         .find(|(_, v)| !v.trim().is_empty())
-        .map(|(_, v)| v)
+        .map(|(_, v)| normalize_title(&v))
+}
+
+/// SFO strings occasionally contain invisible controls or malformed UTF-8.
+/// `from_utf8_lossy` has already made malformed sequences safe; remove only
+/// controls that cannot be rendered in a game title and collapse whitespace.
+fn normalize_title(raw: &str) -> String {
+    raw.chars()
+        .map(|c| if c.is_control() || c.is_whitespace() { ' ' } else { c })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn parse_sfo_fields(data: &[u8], wanted: &[&str]) -> Option<Vec<(String, String)>> {
@@ -1070,4 +1190,111 @@ pub fn is_known_utility(title_id: &str, title: &str, category: Option<&str>) -> 
     }
 
     false
+}
+
+#[cfg(all(test, not(target_os = "vita")))]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn unique_tmp_dir(name: &str) -> String {
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!("vitadeck_test_{}_{}_{}", name, pid, nanos));
+        std::fs::create_dir_all(&dir).expect("create tmp dir");
+        dir.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn category_subdirs_finds_non_game_directories() {
+        let root = unique_tmp_dir("category_subdirs");
+        std::fs::create_dir_all(format!("{}/CAT_PSP", root)).unwrap();
+        std::fs::create_dir_all(format!("{}/SLUS12345", root)).unwrap();
+        std::fs::write(format!("{}/SLUS12345/EBOOT.PBP", root), b"fake").unwrap();
+
+        let subs = category_subdirs(&root);
+        assert_eq!(subs, vec![format!("{}/CAT_PSP", root)]);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn index_pbp_dir_recurses_into_category_folder() {
+        let root = unique_tmp_dir("index_pbp_dir");
+        let game_root = format!("{}/PSP/GAME", root);
+        std::fs::create_dir_all(&game_root).unwrap();
+        std::fs::create_dir_all(format!("{}/CAT_PSX/SLUS01234", game_root)).unwrap();
+        std::fs::write(format!("{}/CAT_PSX/SLUS01234/EBOOT.PBP", game_root), b"fake").unwrap();
+
+        let mut entries = HashMap::new();
+        let mut has_pbp = HashSet::new();
+        let mut log = Vec::new();
+
+        index_pbp_dir(&game_root, &mut entries, &mut has_pbp, &mut log);
+        assert!(entries.is_empty(), "top-level scan should not find the category folder's game");
+
+        for sub in category_subdirs(&game_root) {
+            index_pbp_dir(&sub, &mut entries, &mut has_pbp, &mut log);
+        }
+        assert!(entries.contains_key("SLUS01234"));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn index_iso_dir_recurses_into_category_folder() {
+        let root = unique_tmp_dir("index_iso_dir");
+        let iso_root = format!("{}/ISO", root);
+        std::fs::create_dir_all(format!("{}/CAT_Minis", iso_root)).unwrap();
+        std::fs::write(format!("{}/CAT_Minis/MyGame.iso", iso_root), b"fake").unwrap();
+
+        let mut entries = HashMap::new();
+        let mut log = Vec::new();
+
+        index_iso_dir(&iso_root, &mut entries, &mut log);
+        assert!(entries.is_empty());
+
+        for sub in category_subdirs(&iso_root) {
+            index_iso_dir(&sub, &mut entries, &mut log);
+        }
+        assert!(entries.contains_key("MyGame"));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn category_discovery_supports_nested_cat_folders() {
+        let root = unique_tmp_dir("nested_categories");
+        let game_root = format!("{}/PSP/GAME", root);
+        std::fs::create_dir_all(format!("{}/CAT_Retro/CAT_PSX/SLUS01234", game_root)).unwrap();
+        std::fs::write(
+            format!("{}/CAT_Retro/CAT_PSX/SLUS01234/EBOOT.PBP", game_root),
+            b"fake",
+        )
+        .unwrap();
+
+        let folders = category_subdirs_recursive(&game_root, 3);
+        assert!(folders.contains(&format!("{}/CAT_Retro", game_root)));
+        assert!(folders.contains(&format!("{}/CAT_Retro/CAT_PSX", game_root)));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn disabled_dir_check_matches_exact_path() {
+        let disabled = vec!["ux0:pspemu/ISO/CAT_PSP".to_string()];
+        assert!(is_dir_disabled("ux0:pspemu/ISO/CAT_PSP", &disabled));
+        assert!(!is_dir_disabled("ux0:pspemu/ISO/CAT_PSX", &disabled));
+    }
+
+    #[test]
+    fn normalizes_titles_without_losing_common_game_symbols() {
+        assert_eq!(
+            normalize_title(" ACE  COMBAT™\0\tJOINT\nASSAULT "),
+            "ACE COMBAT™ JOINT ASSAULT"
+        );
+    }
 }

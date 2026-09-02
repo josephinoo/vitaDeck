@@ -31,6 +31,7 @@ pub struct ImageData {
 
 pub struct ArtResult {
     pub title_id: String,
+    pub canonical_title: Option<String>,
     pub cover: Option<ImageData>,
     pub hero: Option<ImageData>,
     pub logo: Option<ImageData>,
@@ -93,6 +94,14 @@ pub fn fetch_image(url: &str) -> Option<ImageData> {
             return None;
         }
     };
+    let dimensions = image::ImageReader::new(std::io::Cursor::new(&bytes))
+        .with_guessed_format()
+        .ok()
+        .and_then(|reader| reader.into_dimensions().ok());
+    if dimensions.is_none() {
+        crate::scanner::write_append_log(&format!("fetch_image unreadable dimensions for {}", url));
+        return None;
+    }
     if is_png(&bytes) {
         if is_placeholder_image(&bytes) {
             return None;
@@ -194,23 +203,9 @@ fn looks_like_mp3(path: &str) -> bool {
 }
 
 pub fn resolve(job: ArtJob, tx: &Sender<ArtResult>) {
-    if !net::wifi_available() {
-        let _ = tx.send(ArtResult {
-            title_id: job.title_id,
-            cover: None,
-            hero: None,
-            logo: None,
-            cover_ok: false,
-            hero_ok: false,
-            logo_ok: false,
-            music_downloaded: false,
-            error: Some("no wifi".to_string()),
-            job_complete: true,
-            images_ok: false,
-        });
-        return;
-    }
-
+    // Do not use SceNetCtl as a hard gate here. Vita3K and a few network
+    // plugins report an unknown NetCtl state while ordinary TCP requests work.
+    // The bounded worker performs the real connectivity check through fetches.
     if job.music_only {
         let url = job
             .known_music_url
@@ -231,14 +226,18 @@ pub fn resolve(job: ArtJob, tx: &Sender<ArtResult>) {
     let mut hero = None;
     let mut logo = None;
     let mut music_url = job.known_music_url.clone();
+    let mut canonical_title = None;
 
     if job.skip_disk {
+        // The catalog's cover is deliberately requested at `medium` for the
+        // browsing grid. Do one small request per card; screenshots belong in
+        // the detail view and must not delay or replace its portrait cover.
         cover = job.known_cover_url.as_deref().and_then(fetch_image);
         if cover.is_none() {
-            cover = job.known_screenshot_url.as_deref().and_then(fetch_image);
+            cover = job.known_icon_url.as_deref().and_then(fetch_image);
         }
         if cover.is_none() {
-            cover = job.known_icon_url.as_deref().and_then(fetch_image);
+            cover = job.known_screenshot_url.as_deref().and_then(fetch_image);
         }
     } else {
         let mut lookup_detail = lookup_one(&job.title_id);
@@ -247,6 +246,7 @@ pub fn resolve(job: ArtJob, tx: &Sender<ArtResult>) {
         }
 
         if let Some(detail) = &lookup_detail {
+            canonical_title = detail.canonical_title.clone();
             if cover.is_none() {
                 cover = detail.cover_url.as_deref().and_then(fetch_image);
             }
@@ -273,7 +273,7 @@ pub fn resolve(job: ArtJob, tx: &Sender<ArtResult>) {
 
         if cover.is_none() && job.system == System::Vita {
             let vf_cover = format!(
-                "https://vitaforge.josephinoo.dev/api/v1/images/cover/{}?size=medium&format=jpeg",
+                "https://vitaforge.josephinoo.dev/api/v1/images/cover/{}?size=large&format=jpeg",
                 job.title_id
             );
             if job.known_cover_url.as_deref() != Some(vf_cover.as_str()) {
@@ -308,10 +308,12 @@ pub fn resolve(job: ArtJob, tx: &Sender<ArtResult>) {
         }
     }
 
+    // Store covers use the same title-ID cache as installed Vita games. This
+    // makes revisiting a store row instant; budget eviction stays in control.
+    if let Some(cover) = &cover {
+        save_to_cache(cover, &cover_cache_path(job.system, &job.art_key));
+    }
     if !job.skip_disk {
-        if let Some(cover) = &cover {
-            save_to_cache(cover, &cover_cache_path(job.system, &job.art_key));
-        }
         if let Some(hero) = &hero {
             save_to_cache(hero, &hero_cache_path(job.system, &job.art_key));
         }
@@ -327,6 +329,7 @@ pub fn resolve(job: ArtJob, tx: &Sender<ArtResult>) {
 
     let _ = tx.send(ArtResult {
         title_id: job.title_id.clone(),
+        canonical_title,
         cover,
         hero,
         logo,
@@ -383,6 +386,7 @@ fn music_worker_sender() -> &'static Sender<MusicJob> {
                 }
                 let _ = job.tx.send(ArtResult {
                     title_id: job.title_id,
+                    canonical_title: None,
                     cover: None,
                     hero: None,
                     logo: None,
@@ -459,7 +463,9 @@ impl LookupTarget {
 }
 
 fn games_checksum(games: &[LookupTarget]) -> u64 {
-    const LOOKUP_CACHE_VERSION: u64 = 0x0B_00;
+    // Bump whenever the matching rules change so a previously incorrect
+    // title/art association cannot survive indefinitely on the device.
+    const LOOKUP_CACHE_VERSION: u64 = 0x0C_00;
     let mut hash: u64 = 0xcbf29ce484222325 ^ LOOKUP_CACHE_VERSION; 
     for g in games {
         for byte in g.art_key.bytes().chain(g.title_id.bytes()) {
@@ -570,8 +576,8 @@ pub fn lookup_one(title_id: &str) -> Option<LookupResult> {
     let bytes = net::download_to_vec(&url, MAX_JSON_BYTES).ok()?;
     let detail: GameDetail = serde_json::from_slice(&bytes).ok()?;
     let canonical_title = detail
-        .cleaned_name
-        .or(detail.name)
+        .name
+        .or(detail.cleaned_name)
         .or(detail.title)
         .filter(|t| !t.trim().is_empty());
 
@@ -626,7 +632,7 @@ fn url_encode(s: &str) -> String {
     encoded
 }
 
-fn is_title_match(target: &str, candidate: &str) -> bool {
+pub(crate) fn is_title_match(target: &str, candidate: &str) -> bool {
     let t = target.to_lowercase();
     let c = candidate.to_lowercase();
     if t.is_empty() || c.is_empty() {
@@ -680,14 +686,16 @@ fn lookup_by_query(query: &str, system: System) -> Option<LookupResult> {
         return None;
     }
 
-    for detail in &details {
+    for detail in details {
         let cand_name = detail
             .cleaned_name
             .as_deref()
             .or(detail.name.as_deref())
             .or(detail.title.as_deref())
             .unwrap_or("");
-        if !cand_name.is_empty() && !is_title_match(&clean_q, cand_name) {
+        // Never use an arbitrary API result. A wrong match is much worse than
+        // temporarily showing the local title/icon while artwork is missing.
+        if cand_name.is_empty() || !is_title_match(&clean_q, cand_name) {
             continue;
         }
         if let Some(tid) = detail
@@ -702,31 +710,42 @@ fn lookup_by_query(query: &str, system: System) -> Option<LookupResult> {
                 }
             }
         }
+
+        let canonical_title = detail.name.or(detail.cleaned_name).or(detail.title);
+        return Some(LookupResult {
+            is_game: true,
+            canonical_title,
+            cover_url: detail.cover_path.as_deref().filter(|s| !s.trim().is_empty()).map(asset_url),
+            screenshot_url: select_best_variant(&detail.heroes),
+            logo_url: select_best_logo_variant(&detail.logos),
+            music_url: select_best_variant(&detail.musics),
+        });
     }
 
-    for detail in &details {
-        if let Some(tid) = detail
-            .title_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            if let Some(full) = lookup_one(tid) {
-                return Some(full);
-            }
-        }
+    None
+}
+
+#[cfg(test)]
+mod lookup_tests {
+    use super::{is_title_match, GameDetail};
+
+    #[test]
+    fn fuzzy_title_matching_rejects_unrelated_api_results() {
+        assert!(is_title_match("Ace Combat Joint Assault", "Ace Combat: Joint Assault"));
+        assert!(is_title_match("God Eater", "God Eater Burst"));
+        assert!(!is_title_match("Alisa", "God Eater"));
+        assert!(!is_title_match("UnMetal", "Metal Gear Solid"));
     }
 
-    let first = details.into_iter().next()?;
-    let canonical_title = first.cleaned_name.or(first.name).or(first.title);
-    Some(LookupResult {
-        is_game: true,
-        canonical_title,
-        cover_url: first.cover_path.as_deref().filter(|s| !s.trim().is_empty()).map(asset_url),
-        screenshot_url: select_best_variant(&first.heroes),
-        logo_url: select_best_logo_variant(&first.logos),
-        music_url: select_best_variant(&first.musics),
-    })
+    #[test]
+    fn psp_detail_exposes_canonical_name() {
+        let detail: GameDetail = serde_json::from_str(
+            r#"{"title_id":"NPJH50137","platform":"psp","name":"Tekken: Dark Resurrection","cleaned_name":"Tekken Dark Resurrection","cover_path":"covers/NPJH50137.png"}"#,
+        )
+        .unwrap();
+        assert_eq!(detail.cleaned_name.as_deref(), Some("Tekken Dark Resurrection"));
+        assert_eq!(detail.name.as_deref(), Some("Tekken: Dark Resurrection"));
+    }
 }
 
 pub fn lookup_batch(games: &[LookupTarget]) -> HashMap<String, LookupResult> {

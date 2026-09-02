@@ -2,11 +2,11 @@ use crate::runtime::LruCache;
 use crate::scanner::ImageBytes;
 use std::collections::HashSet;
 use std::io::Cursor;
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::mpsc::{channel, sync_channel, Receiver, SyncSender};
 
 const MAX_CACHE_BYTES: usize = 10 * 1024 * 1024;
 
-const MAX_DECODE_PENDING: usize = 6;
+const MAX_DECODE_PENDING: usize = 3;
 const MAX_DECODE_RESULTS_PER_FRAME: usize = 1;
 
 #[derive(Clone, Copy)]
@@ -23,7 +23,7 @@ impl TextureKind {
             TextureKind::Hero
         } else if key.ends_with(":logo") {
             TextureKind::Logo
-        } else if key.ends_with(":shot") {
+        } else if key.contains(":shot") {
             TextureKind::Screenshot
         } else {
             TextureKind::Cover
@@ -44,13 +44,14 @@ pub struct TextureCache {
     handles: LruCache<String, egui::TextureHandle>,
     failed: HashSet<String>,
     pending: HashSet<String>,
-    decode_tx: Sender<(String, TextureKind, ImageBytes)>,
+    decode_tx: SyncSender<(String, TextureKind, ImageBytes)>,
     decode_rx: Receiver<(String, Option<egui::ColorImage>)>,
+    accepting_decodes: bool,
 }
 
 impl Default for TextureCache {
     fn default() -> Self {
-        let (req_tx, req_rx) = channel::<(String, TextureKind, ImageBytes)>();
+        let (req_tx, req_rx) = sync_channel::<(String, TextureKind, ImageBytes)>(MAX_DECODE_PENDING);
         let (res_tx, res_rx) = channel::<(String, Option<egui::ColorImage>)>();
 
         std::thread::spawn(move || {
@@ -71,6 +72,7 @@ impl Default for TextureCache {
             pending: HashSet::new(),
             decode_tx: req_tx,
             decode_rx: res_rx,
+            accepting_decodes: true,
         }
     }
 }
@@ -106,9 +108,9 @@ impl TextureCache {
         if self.failed.contains(key) {
             return None;
         }
-        if !self.pending.contains(key) && self.pending.len() < MAX_DECODE_PENDING {
+        if self.accepting_decodes && !self.pending.contains(key) && self.pending.len() < MAX_DECODE_PENDING {
             let kind = TextureKind::from_key(key);
-            if self.decode_tx.send((key.to_string(), kind, bytes.clone())).is_ok() {
+            if self.decode_tx.try_send((key.to_string(), kind, bytes.clone())).is_ok() {
                 self.pending.insert(key.to_string());
             }
         }
@@ -118,6 +120,7 @@ impl TextureCache {
     pub fn set_pressure_fraction(&mut self, fraction: f32) {
         let budget = ((MAX_CACHE_BYTES as f32) * fraction.clamp(0.05, 1.0)) as usize;
         self.handles.set_max_cost_bytes(budget);
+        self.accepting_decodes = fraction > 0.2;
     }
 
     pub fn bytes_in_use(&self) -> usize {
@@ -126,6 +129,10 @@ impl TextureCache {
 
     pub fn budget_bytes(&self) -> usize {
         self.handles.max_cost_bytes()
+    }
+
+    pub fn pending_count(&self) -> usize {
+        self.pending.len()
     }
 
     pub fn invalidate(&mut self, key: &str) {

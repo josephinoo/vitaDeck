@@ -124,8 +124,10 @@ impl AudioEngine {
             load_sound(&mut sounds, SoundEffect::Navigate, "deck_ui_navigation.wav");
             load_sound(&mut sounds, SoundEffect::Confirm, "deck_ui_default_activation.wav");
             load_sound(&mut sounds, SoundEffect::TabSwitch, "deck_ui_tab_transition_01.wav");
-            load_sound(&mut sounds, SoundEffect::OpenModal, "deck_ui_show_modal.wav");
-            load_sound(&mut sounds, SoundEffect::CloseModal, "deck_ui_hide_modal.wav");
+            // The modal files are noticeably long and intrusive. Reuse the
+            // short, already-normalized UI sounds until a dedicated set ships.
+            load_sound(&mut sounds, SoundEffect::OpenModal, "deck_ui_default_activation.wav");
+            load_sound(&mut sounds, SoundEffect::CloseModal, "deck_ui_navigation.wav");
             load_sound(&mut sounds, SoundEffect::LaunchGame, "deck_ui_launch_game.wav");
 
             let sounds: HashMap<SoundEffect, WavSound> =
@@ -597,7 +599,14 @@ fn audio_decoder_thread_main(rx: mpsc::Receiver<MusicCmd>, queue: Arc<SharedAudi
                     current_track = Some(next);
                 }
                 DecodeOutcome::LoopSame => {
-                    current_track = Some(path);
+                    // Reopening the same MP3 in a tight loop repeatedly
+                    // invokes sceIoOpen. Vita3K currently aborts inside its
+                    // file bridge for that pattern instead of returning an
+                    // I/O error. Stop cleanly at EOF; selecting another game
+                    // still starts its music normally.
+                    crate::logger::log("audio: background track ended; stopped to avoid repeated file reopen");
+                    queue.playing.store(false, Ordering::SeqCst);
+                    current_track = None;
                 }
                 DecodeOutcome::Stopped => {
                     queue.playing.store(false, Ordering::SeqCst);

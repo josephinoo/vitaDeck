@@ -7,20 +7,30 @@ const ES: &str = include_str!("../assets/locales/es-ES/main.ftl");
 const PT: &str = include_str!("../assets/locales/pt-BR/main.ftl");
 const FR: &str = include_str!("../assets/locales/fr-FR/main.ftl");
 const IT: &str = include_str!("../assets/locales/it-IT/main.ftl");
+const DE: &str = include_str!("../assets/locales/de-DE/main.ftl");
 
 const STATIC_KEYS: &[&str] = &[
     "tab-all", "tab-recent", "tab-store", "tab-favorites", "menu", "search", "clear-search",
     "settings", "back", "close", "select", "launch", "install", "details", "collections",
-    "remove", "toggle", "view", "rescan", "change", "clean", "purge-music", "purge-all",
+    "remove", "toggle", "view", "view-coverflow", "view-list", "rescan", "change", "clean", "purge-music", "purge-all", "new-tab", "new-tab-title",
+    "game-options", "rename-game", "hide-game",
+    "organize-tabs", "move-tab", "delete-tab", "finish",
     "loading-wait", "loading-scan", "loading-artwork", "search-store", "search-games",
     "collection-title", "confirm-download", "download-question", "download-yes", "cancel",
     "settings-general", "settings-storage", "settings-version", "settings-library", "settings-collections",
     "settings-wifi", "settings-free-ram", "settings-textures", "settings-bgm", "settings-bgm-hint",
     "settings-language", "settings-cache-limit", "settings-cache-hint", "settings-covers", "settings-heroes",
+    "settings-library-sort", "sort-name", "sort-most-played", "sort-recent", "sort-system",
     "settings-music", "settings-total", "settings-orphans", "settings-clean-orphans", "settings-purge-music",
     "settings-purge-all", "empty-games", "empty-log", "no-cover", "status-enabled", "status-disabled", "status-connected",
     "status-offline", "budget-unlimited", "budget-custom", "language-name-en-US", "language-name-es-ES",
-    "language-name-pt-BR", "language-name-fr-FR", "language-name-it-IT",
+    "language-name-pt-BR", "language-name-fr-FR", "language-name-it-IT", "language-name-de-DE",
+    "open", "settings-scan-folders", "settings-scan-folders-hint", "scan-folders-title", "scan-folders-empty", "notice-scan-folders",
+    "filters", "region", "store-filters-title", "all-regions", "all-regions-short", "regions-count",
+    "loading-store",
+    "launch-count",
+    "safe-mode",
+    "notice-download-already-queued",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -35,6 +45,8 @@ pub enum Locale {
     FrFr,
     #[serde(rename = "it-IT")]
     ItIt,
+    #[serde(rename = "de-DE")]
+    DeDe,
 }
 
 impl Default for Locale {
@@ -43,13 +55,13 @@ impl Default for Locale {
 
 impl Locale {
     pub fn next(self) -> Self {
-        match self { Self::EnUs => Self::EsEs, Self::EsEs => Self::PtBr, Self::PtBr => Self::FrFr, Self::FrFr => Self::ItIt, Self::ItIt => Self::EnUs }
+        match self { Self::EnUs => Self::EsEs, Self::EsEs => Self::PtBr, Self::PtBr => Self::FrFr, Self::FrFr => Self::ItIt, Self::ItIt => Self::DeDe, Self::DeDe => Self::EnUs }
     }
     fn tag(self) -> &'static str {
-        match self { Self::EnUs => "en-US", Self::EsEs => "es-ES", Self::PtBr => "pt-BR", Self::FrFr => "fr-FR", Self::ItIt => "it-IT" }
+        match self { Self::EnUs => "en-US", Self::EsEs => "es-ES", Self::PtBr => "pt-BR", Self::FrFr => "fr-FR", Self::ItIt => "it-IT", Self::DeDe => "de-DE" }
     }
     fn source(self) -> &'static str {
-        match self { Self::EnUs => EN, Self::EsEs => ES, Self::PtBr => PT, Self::FrFr => FR, Self::ItIt => IT }
+        match self { Self::EnUs => EN, Self::EsEs => ES, Self::PtBr => PT, Self::FrFr => FR, Self::ItIt => IT, Self::DeDe => DE }
     }
 }
 
@@ -99,7 +111,7 @@ mod tests {
     use super::*;
     #[test]
     fn every_builtin_locale_has_static_messages() {
-        for locale in [Locale::EnUs, Locale::EsEs, Locale::PtBr, Locale::FrFr, Locale::ItIt] {
+        for locale in [Locale::EnUs, Locale::EsEs, Locale::PtBr, Locale::FrFr, Locale::ItIt, Locale::DeDe] {
             let localizer = Localizer::new(locale);
             for key in STATIC_KEYS {
                 assert!(!localizer.text(key).is_empty(), "{locale:?} missing {key}");
@@ -107,5 +119,5 @@ mod tests {
         }
     }
     #[test]
-    fn locale_cycles() { assert_eq!(Locale::ItIt.next(), Locale::EnUs); }
+    fn locale_cycles() { assert_eq!(Locale::DeDe.next(), Locale::EnUs); }
 }

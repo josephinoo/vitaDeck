@@ -2,6 +2,7 @@ use crate::bgdl::{self, BGDL_TYPE_GAME};
 use crate::licensing;
 use crate::scanner::{Game, System};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::mpsc::{channel, Receiver};
 
 pub const STORE_API_URL: &str = "https://vitaforge.josephinoo.dev/api/v1/vitadeck/store";
@@ -133,6 +134,16 @@ pub fn absolute_url(path: &str) -> String {
     force_format(&joined)
 }
 
+/// Stable public artwork route. Unlike catalog-relative paths this remains
+/// valid across catalog cache revisions and works for every PS Vita title ID.
+pub fn cover_url_for_title_id(title_id: &str) -> Option<String> {
+    let id = normalize_title_id(title_id);
+    if id.len() != 9 || !id.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
+        return None;
+    }
+    Some(format!("{VITAFORGE_ORIGIN}/api/v1/images/cover/{id}?size=large&format=jpeg"))
+}
+
 fn image_format_for(url: &str) -> &'static str {
     if url.contains("/images/icon/") {
         "png"
@@ -169,7 +180,35 @@ struct VersionResponse {
 pub struct StoreManager {
     pub items: Vec<StoreItem>,
     pub loading: bool,
-    rx: Option<Receiver<Option<Vec<StoreItem>>>>,
+    title_index: HashMap<String, usize>,
+    rx: Option<Receiver<Option<LoadedCatalog>>>,
+}
+
+struct LoadedCatalog {
+    items: Vec<StoreItem>,
+    games: Vec<Game>,
+    title_index: HashMap<String, usize>,
+}
+
+impl LoadedCatalog {
+    fn new(items: Vec<StoreItem>) -> Self {
+        let title_index = items
+            .iter()
+            .enumerate()
+            .filter_map(|(index, item)| {
+                item.title_id
+                    .as_deref()
+                    .map(normalize_title_id)
+                    .map(|title_id| (title_id, index))
+            })
+            .collect();
+        let games = games_from_items(&items);
+        Self { items, games, title_index }
+    }
+}
+
+fn normalize_title_id(title_id: &str) -> String {
+    title_id.trim().to_ascii_uppercase()
 }
 
 impl Default for StoreManager {
@@ -192,35 +231,44 @@ fn cache_path(name: &str) -> String {
 impl StoreManager {
     pub fn new() -> Self {
         let (tx, rx) = channel();
-        let cached = Self::load_cache();
 
         std::thread::spawn(move || {
-            let _ = tx.send(Self::fetch_remote());
+            let _ = tx.send(Self::load_or_fetch_remote());
         });
 
         Self {
-            items: cached.unwrap_or_default(),
+            // Disk parsing and the version probe both stay off the UI thread.
+            items: Vec::new(),
             loading: true,
+            title_index: HashMap::new(),
             rx: Some(rx),
         }
     }
 
-    pub fn tick(&mut self) -> bool {
+    pub fn tick(&mut self) -> Option<Vec<Game>> {
         if let Some(rx) = &self.rx {
-            if let Ok(maybe_items) = rx.try_recv() {
+            if let Ok(maybe_catalog) = rx.try_recv() {
                 self.loading = false;
                 self.rx = None;
-                if let Some(new_items) = maybe_items {
-                    self.items = new_items;
-                    return true;
+                if let Some(catalog) = maybe_catalog {
+                    self.items = catalog.items;
+                    self.title_index = catalog.title_index;
+                    return Some(catalog.games);
                 }
             }
         }
-        false
+        None
     }
 
     pub fn item_by_title_id(&self, title_id: &str) -> Option<&StoreItem> {
-        self.items.iter().find(|i| i.title_id.as_deref() == Some(title_id))
+        self.index_by_title_id(title_id).and_then(|index| self.items.get(index))
+    }
+
+    pub fn index_by_title_id(&self, title_id: &str) -> Option<usize> {
+        self.title_index
+            .get(title_id)
+            .or_else(|| self.title_index.get(&normalize_title_id(title_id)))
+            .copied()
     }
 
     pub fn load_cache() -> Option<Vec<StoreItem>> {
@@ -265,8 +313,20 @@ impl StoreManager {
     }
 
     fn fetch_etag() -> Option<String> {
-        let bytes = crate::net::download_to_vec(STORE_VERSION_URL, MAX_VERSION_BYTES).ok()?;
-        let resp: VersionResponse = serde_json::from_slice(&bytes).ok()?;
+        let bytes = match crate::net::download_to_vec(STORE_VERSION_URL, MAX_VERSION_BYTES) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                crate::logger::log(&format!("StoreManager: version probe request failed: {error}"));
+                return None;
+            }
+        };
+        let resp: VersionResponse = match serde_json::from_slice(&bytes) {
+            Ok(response) => response,
+            Err(error) => {
+                crate::logger::log(&format!("StoreManager: invalid version response: {error}"));
+                return None;
+            }
+        };
         nonempty(Some(resp.etag.as_str())).map(|s| s.to_string())
     }
 
@@ -348,7 +408,7 @@ impl StoreManager {
         filtered
     }
 
-    fn fetch_remote() -> Option<Vec<StoreItem>> {
+    fn load_or_fetch_remote() -> Option<LoadedCatalog> {
         crate::logger::log("StoreManager: fetching store catalog");
         let cached = Self::load_cache();
         let remote_etag = Self::fetch_etag();
@@ -358,11 +418,11 @@ impl StoreManager {
                     && cached.as_ref().is_some_and(|c| !c.is_empty()) =>
             {
                 crate::logger::log("StoreManager: catalog etag unchanged, using cache");
-                return None;
+                return cached.map(LoadedCatalog::new);
             }
             None if cached.as_ref().is_some_and(|c| !c.is_empty()) => {
                 crate::logger::log("StoreManager: version probe failed, keeping cache");
-                return None;
+                return cached.map(LoadedCatalog::new);
             }
             None => crate::logger::log("StoreManager: version probe failed, downloading store"),
             Some(_) => crate::logger::log("StoreManager: catalog changed, downloading store"),
@@ -374,21 +434,21 @@ impl StoreManager {
         }
         if let Err(e) = crate::net::download_to_file(STORE_API_URL, &raw_path, MAX_STORE_BYTES) {
             crate::logger::log(&format!("StoreManager: fetch_remote error: {e}"));
-            return None;
+            return cached.map(LoadedCatalog::new);
         }
 
         let file = match std::fs::File::open(&raw_path) {
             Ok(f) => f,
             Err(e) => {
                 crate::logger::log(&format!("StoreManager: open store catalog error: {e}"));
-                return None;
+                return cached.map(LoadedCatalog::new);
             }
         };
         let items = match serde_json::from_reader::<_, SnapshotResponse>(std::io::BufReader::new(file)) {
             Ok(snapshot) => snapshot.data,
             Err(e) => {
                 crate::logger::log(&format!("StoreManager: failed to parse store catalog: {e}"));
-                return None;
+                return cached.map(LoadedCatalog::new);
             }
         };
         let filtered = Self::filter_items(items);
@@ -401,33 +461,11 @@ impl StoreManager {
             Self::save_etag(&etag);
         }
         let _ = std::fs::remove_file(&raw_path);
-        Some(filtered)
+        Some(LoadedCatalog::new(filtered))
     }
 
     pub fn to_games(&self) -> Vec<Game> {
-        self.items
-            .iter()
-            .filter_map(|item| {
-                let title_id = item.title_id.as_ref()?.clone();
-                Some(Game {
-                    system: System::Vita,
-                    title: item.name.clone(),
-                    title_id: title_id.clone(),
-                    art_key: title_id,
-                    cover_bytes: None,
-                    hero_bytes: None,
-                    logo_bytes: None,
-                    has_box_art: false,
-                    has_hero: false,
-                    has_logo: false,
-                    has_bubble: false,
-                    file_path: None,
-                    music_path: None,
-                    music_resolved: false,
-                    is_game: Some(true),
-                })
-            })
-            .collect()
+        games_from_items(&self.items)
     }
 
     pub fn download_and_install(&self, title_id: &str) -> anyhow::Result<()> {
@@ -457,5 +495,64 @@ impl StoreManager {
         bgdl::start_bgdl(&item.name, &item.download_url, rif.as_deref(), BGDL_TYPE_GAME)?;
         crate::logger::log(&format!("StoreManager: enqueued download for '{}' ({title_id})", item.name));
         Ok(())
+    }
+}
+
+fn games_from_items(items: &[StoreItem]) -> Vec<Game> {
+    items
+        .iter()
+        .filter_map(|item| {
+            let title_id = item.title_id.as_ref()?.clone();
+            Some(Game {
+                system: System::Vita,
+                title: item.name.clone(),
+                title_id: title_id.clone(),
+                art_key: title_id,
+                cover_bytes: None,
+                hero_bytes: None,
+                logo_bytes: None,
+                has_box_art: false,
+                has_hero: false,
+                has_logo: false,
+                has_bubble: false,
+                file_path: None,
+                music_path: None,
+                music_resolved: false,
+                is_game: Some(true),
+            })
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod catalog_tests {
+    use super::*;
+
+    #[test]
+    fn loaded_catalog_builds_games_and_case_insensitive_index() {
+        let item: StoreItem = serde_json::from_str(
+            r#"{"title_id":"PCSE00001","name":"Test","region":"US","download_url":"https://example.com/game"}"#,
+        )
+        .unwrap();
+        let catalog = LoadedCatalog::new(vec![item]);
+        assert_eq!(catalog.games.len(), 1);
+        assert_eq!(catalog.title_index.get("PCSE00001"), Some(&0));
+        assert_eq!(normalize_title_id(" pcse00001 "), "PCSE00001");
+    }
+
+    #[test]
+    fn large_catalog_is_fully_indexed_before_delivery() {
+        let items: Vec<StoreItem> = (0..4_000)
+            .map(|index| {
+                serde_json::from_str(&format!(
+                    r#"{{"title_id":"PCSE{index:05}","name":"Game {index}","region":"US","download_url":"https://example.com/{index}"}}"#
+                ))
+                .unwrap()
+            })
+            .collect();
+        let catalog = LoadedCatalog::new(items);
+        assert_eq!(catalog.games.len(), 4_000);
+        assert_eq!(catalog.title_index.len(), 4_000);
+        assert_eq!(catalog.title_index.get("PCSE03999"), Some(&3_999));
     }
 }
