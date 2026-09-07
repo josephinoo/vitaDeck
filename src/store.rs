@@ -3,7 +3,7 @@ use crate::licensing;
 use crate::scanner::{Game, System};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::mpsc::{channel, Receiver};
+use std::sync::mpsc::{channel, Receiver, TryRecvError};
 
 pub const STORE_API_URL: &str = "https://vitaforge.josephinoo.dev/api/v1/vitadeck/store";
 pub const STORE_VERSION_URL: &str = "https://vitaforge.josephinoo.dev/api/v1/vitadeck/store/version";
@@ -141,7 +141,9 @@ pub fn cover_url_for_title_id(title_id: &str) -> Option<String> {
     if id.len() != 9 || !id.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
         return None;
     }
-    Some(format!("{VITAFORGE_ORIGIN}/api/v1/images/cover/{id}?size=large&format=jpeg"))
+    // Medium is sharp enough for Vita's card grid and avoids rejecting a
+    // valid cover merely because a large original exceeds the download cap.
+    Some(format!("{VITAFORGE_ORIGIN}/api/v1/images/cover/{id}?size=medium&format=jpeg"))
 }
 
 fn image_format_for(url: &str) -> &'static str {
@@ -182,6 +184,7 @@ pub struct StoreManager {
     pub loading: bool,
     title_index: HashMap<String, usize>,
     rx: Option<Receiver<Option<LoadedCatalog>>>,
+    retry_frames: u32,
 }
 
 struct LoadedCatalog {
@@ -230,31 +233,54 @@ fn cache_path(name: &str) -> String {
 
 impl StoreManager {
     pub fn new() -> Self {
-        let (tx, rx) = channel();
+        // Use the last usable catalog immediately. Network refresh happens in
+        // parallel, so Store is still available if the version endpoint fails.
+        let cached = Self::load_cache().unwrap_or_default();
+        let cached_catalog = LoadedCatalog::new(cached);
+        let rx = Self::spawn_loader();
 
+        Self {
+            items: cached_catalog.items,
+            loading: true,
+            title_index: cached_catalog.title_index,
+            rx: Some(rx),
+            retry_frames: 0,
+        }
+    }
+
+    fn spawn_loader() -> Receiver<Option<LoadedCatalog>> {
+        let (tx, rx) = channel();
         std::thread::spawn(move || {
             let _ = tx.send(Self::load_or_fetch_remote());
         });
-
-        Self {
-            // Disk parsing and the version probe both stay off the UI thread.
-            items: Vec::new(),
-            loading: true,
-            title_index: HashMap::new(),
-            rx: Some(rx),
-        }
+        rx
     }
 
     pub fn tick(&mut self) -> Option<Vec<Game>> {
         if let Some(rx) = &self.rx {
-            if let Ok(maybe_catalog) = rx.try_recv() {
-                self.loading = false;
-                self.rx = None;
-                if let Some(catalog) = maybe_catalog {
-                    self.items = catalog.items;
-                    self.title_index = catalog.title_index;
-                    return Some(catalog.games);
+            match rx.try_recv() {
+                Ok(maybe_catalog) => {
+                    self.loading = false;
+                    self.rx = None;
+                    if let Some(catalog) = maybe_catalog {
+                        self.items = catalog.items;
+                        self.title_index = catalog.title_index;
+                        self.retry_frames = 0;
+                        return Some(catalog.games);
+                    }
+                    crate::logger::log("StoreManager: no catalog available; will retry");
                 }
+                Err(TryRecvError::Disconnected) => self.rx = None,
+                Err(TryRecvError::Empty) => {}
+            }
+        }
+        if self.rx.is_none() && self.items.is_empty() {
+            self.retry_frames += 1;
+            if self.retry_frames >= 600 {
+                self.retry_frames = 0;
+                self.loading = true;
+                self.rx = Some(Self::spawn_loader());
+                crate::logger::log("StoreManager: retrying catalog fetch");
             }
         }
         None

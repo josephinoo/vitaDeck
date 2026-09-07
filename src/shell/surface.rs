@@ -16,8 +16,9 @@ pub struct FramePaintStats {
 pub const WIDTH: u32 = 960;
 pub const HEIGHT: u32 = 544;
 pub struct VitaSurface {
-    canvas: Canvas<Window>,
+    // Rust drops fields in declaration order. Textures must die before their renderer.
     egui_painter: SdlEguiPainter,
+    canvas: Canvas<Window>,
 }
 impl VitaSurface {
     pub fn new(video: &sdl2::VideoSubsystem) -> Result<Self> {
@@ -67,6 +68,11 @@ impl VitaSurface {
         self.canvas.set_draw_color(sdl2::pixels::Color::BLACK);
         self.canvas.clear();
     }
+    pub fn log_resources(&self) {
+        let (textures, pending, pending_bytes) = self.egui_painter.resource_counts();
+        crate::logger::log(&format!("RENDER textures={} pending={} pending_kb={}",
+            textures, pending, pending_bytes / 1024));
+    }
     pub fn paint_egui(
         &mut self,
         pixels_per_point: f32,
@@ -89,6 +95,7 @@ impl VitaSurface {
         let present_started_at = std::time::Instant::now();
         self.canvas.present();
         let present_secs = present_started_at.elapsed().as_secs_f64();
+        self.egui_painter.after_present();
         Ok(FramePaintStats {
             texture_apply_secs,
             geometry_secs,

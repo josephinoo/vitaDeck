@@ -91,16 +91,19 @@ pub fn find_next_frame(bytes: &[u8], start: usize) -> Option<usize> {
     let mut pos = start;
 
     if let Some(tag_len) = id3_tag_len(&bytes[pos.min(bytes.len())..]) {
-        let skip = tag_len as usize;
-        if pos + skip >= bytes.len() {
+        let skip = usize::try_from(tag_len).unwrap_or(usize::MAX);
+        let Some(new_pos) = pos.checked_add(skip) else {
+            return None;
+        };
+        if new_pos >= bytes.len() {
             return None;
         }
-        pos += skip;
+        pos = new_pos;
     }
     while pos + 4 <= bytes.len() {
         if let Some(frame) = parse_frame_header(&bytes[pos..]) {
-            let next = pos + frame.len;
-            if next + 4 > bytes.len() || parse_frame_header(&bytes[next..]).is_some() {
+            let next = pos.saturating_add(frame.len);
+            if next + 4 > bytes.len() || (next <= bytes.len() && parse_frame_header(&bytes[next..]).is_some()) {
                 return Some(pos);
             }
         }
@@ -108,3 +111,25 @@ pub fn find_next_frame(bytes: &[u8], start: usize) -> Option<usize> {
     }
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_find_next_frame_with_corrupt_large_id3_tag() {
+        // Tag with size bits set to maximum (0x7F in all 4 bytes)
+        let mut data = vec![b'I', b'D', b'3', 3, 0, 0, 0x7F, 0x7F, 0x7F, 0x7F];
+        data.extend_from_slice(&[0; 100]);
+        // Should return None without overflowing or panicking
+        assert_eq!(find_next_frame(&data, 0), None);
+    }
+
+    #[test]
+    fn test_id3_tag_len() {
+        let tag = [b'I', b'D', b'3', 3, 0, 0, 0, 0, 1, 0];
+        // size: 1 << 7 = 128 bytes. 10 header + 128 = 138.
+        assert_eq!(id3_tag_len(&tag), Some(138));
+    }
+}
+

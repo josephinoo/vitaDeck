@@ -191,7 +191,6 @@ pub fn scan_installed_games(disabled_dirs: &[String], custom_dirs: &[String]) ->
 struct PspemuEntry {
     art_key: String,
     title: String,
-    icon0: Option<ImageBytes>,
     system_hint: System,
     source_dir: Option<String>,
     file_path: String,
@@ -271,9 +270,9 @@ fn index_pbp_dir(
             continue;
         }
 
-        let pbp_data = read_pbp_sections(&pbp);
-        let sfo_fields = pbp_data.as_ref().and_then(|d| {
-            parse_sfo_fields(&d.param_sfo, &["DISC_ID", "TITLE_ID", "CATEGORY", "TITLE", "STITLE"])
+        let sfo_data = read_pbp_sfo(&pbp);
+        let sfo_fields = sfo_data.as_ref().and_then(|d| {
+            parse_sfo_fields(d, &["DISC_ID", "TITLE_ID", "CATEGORY", "TITLE", "STITLE"])
         });
 
         let system_hint = classify_pspemu(&title_id, sfo_fields.as_deref());
@@ -290,15 +289,10 @@ fn index_pbp_dir(
             .map(|(_, v)| normalize_title(v))
             .unwrap_or_else(|| title_id.clone());
 
-        let icon0 = pbp_data
-            .as_ref()
-            .filter(|d| !d.icon0.is_empty())
-            .map(|d| (true, d.icon0.clone()));
-
         let source_dir = Some(format!("{}/{}", game_root, title_id));
 
         has_pbp.insert(title_id.clone());
-        entries.insert(title_id, PspemuEntry { art_key, title, icon0, system_hint, source_dir, file_path: pbp });
+        entries.insert(title_id, PspemuEntry { art_key, title, system_hint, source_dir, file_path: pbp });
     }
 }
 
@@ -332,7 +326,6 @@ fn index_iso_dir(
         entries.entry(stem).or_insert(PspemuEntry {
             art_key,
             title,
-            icon0: None,
             system_hint: System::Psp,
             source_dir: None,
             file_path: iso_path,
@@ -572,13 +565,16 @@ fn scan_vita_apps(
                         }
                         true
                     }
-                    None => match pspemu_hit.and_then(|(_, e)| e.icon0.as_ref()) {
-                        Some(icon) => {
-                            persist_cover_bytes(system, &art_key, icon);
-                            true
+                    None => {
+                        let icon_bytes = pspemu_hit.and_then(|(_, e)| read_pbp_icon0(&e.file_path));
+                        match icon_bytes {
+                            Some(icon) => {
+                                persist_cover_bytes(system, &art_key, &(true, icon));
+                                true
+                            }
+                            None => false,
                         }
-                        None => false,
-                    },
+                    }
                 }
             };
 
@@ -661,8 +657,8 @@ fn emit_unbubbled_pspemu_games(
         let cache_path_jpg = format!("{}.jpg", cover_cache_path(system, &art_key));
         let has_cover = if sce_file_exists(&cache_path_png) || sce_file_exists(&cache_path_jpg) {
             true
-        } else if let Some(icon) = &entry.icon0 {
-            persist_cover_bytes(system, &art_key, icon);
+        } else if let Some(icon_bytes) = read_pbp_icon0(&entry.file_path) {
+            persist_cover_bytes(system, &art_key, &(true, icon_bytes));
             true
         } else {
             false
@@ -823,6 +819,9 @@ pub fn load_vita_cover(title_id: &str) -> (Option<ImageBytes>, &'static str) {
 
     for (path, source) in candidates {
         if let Some(bytes) = read_file(&path) {
+            if crate::textures::source_exceeds_decode_budget(&bytes) {
+                continue;
+            }
             let is_png_file = is_png(&bytes);
             return (Some((is_png_file, bytes)), source);
         }
@@ -905,8 +904,50 @@ fn read_file(path: &str) -> Option<Vec<u8>> {
 }
 
 pub struct PbpSections {
+    #[allow(dead_code)]
     param_sfo: Vec<u8>,
     icon0: Vec<u8>,
+}
+
+fn read_pbp_range(file: &mut File, start: u32, end: u32) -> Vec<u8> {
+    if end <= start {
+        return Vec::new();
+    }
+    let len = (end - start) as usize;
+    if len > 4 * 1024 * 1024 || file.seek(SeekFrom::Start(start as u64)).is_err() {
+        return Vec::new();
+    }
+    let mut buf = vec![0u8; len];
+    match file.read_exact(&mut buf) {
+        Ok(()) => buf,
+        Err(_) => Vec::new(),
+    }
+}
+
+fn read_pbp_sfo(path: &str) -> Option<Vec<u8>> {
+    let mut file = File::open(path).ok()?;
+    let mut header = [0u8; 0x28];
+    file.read_exact(&mut header).ok()?;
+    if &header[0..4] != b"\0PBP" {
+        return None;
+    }
+    let sfo_off = u32::from_le_bytes(header[8..12].try_into().ok()?);
+    let icon0_off = u32::from_le_bytes(header[12..16].try_into().ok()?);
+    let bytes = read_pbp_range(&mut file, sfo_off, icon0_off);
+    if bytes.is_empty() { None } else { Some(bytes) }
+}
+
+fn read_pbp_icon0(path: &str) -> Option<Vec<u8>> {
+    let mut file = File::open(path).ok()?;
+    let mut header = [0u8; 0x28];
+    file.read_exact(&mut header).ok()?;
+    if &header[0..4] != b"\0PBP" {
+        return None;
+    }
+    let icon0_off = u32::from_le_bytes(header[12..16].try_into().ok()?);
+    let icon1_off = u32::from_le_bytes(header[16..20].try_into().ok()?);
+    let bytes = read_pbp_range(&mut file, icon0_off, icon1_off);
+    if bytes.is_empty() { None } else { Some(bytes) }
 }
 
 fn read_pbp_sections(path: &str) -> Option<PbpSections> {
@@ -927,23 +968,8 @@ fn read_pbp_sections(path: &str) -> Option<PbpSections> {
         offset_at(2),
     );
 
-    let read_range = |file: &mut File, start: u32, end: u32| -> Vec<u8> {
-        if end <= start {
-            return Vec::new();
-        }
-        let len = (end - start) as usize;
-        if len > 4 * 1024 * 1024 || file.seek(SeekFrom::Start(start as u64)).is_err() {
-            return Vec::new();
-        }
-        let mut buf = vec![0u8; len];
-        match file.read_exact(&mut buf) {
-            Ok(()) => buf,
-            Err(_) => Vec::new(),
-        }
-    };
-
-    let param_sfo = read_range(&mut file, sfo_off, icon0_off);
-    let icon0 = read_range(&mut file, icon0_off, icon1_off);
+    let param_sfo = read_pbp_range(&mut file, sfo_off, icon0_off);
+    let icon0 = read_pbp_range(&mut file, icon0_off, icon1_off);
 
     Some(PbpSections { param_sfo, icon0 })
 }

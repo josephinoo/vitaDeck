@@ -376,9 +376,9 @@ fn draw_game_card_with_painter(
     let rounding = CornerRadius::same(12);
 
     if t > 0.01 {
-        for i in 0..6 {
-            let grow = 1.5 + i as f32 * 2.4;
-            let alpha = (26.0 * t * (1.0 - i as f32 / 6.0)) as u8;
+        for i in 0..2 {
+            let grow = 1.8 + i as f32 * 3.6;
+            let alpha = (36.0 * t * (1.0 - i as f32 / 2.0)) as u8;
             painter.rect_filled(
                 card_rect.expand(grow),
                 CornerRadius::same((12.0 + grow) as u8),
@@ -1190,7 +1190,8 @@ fn draw_collection_picker(ui: &mut egui::Ui, app: &App, screen: Rect, commands: 
     let panel_h = (app.collections.items.len() as f32 * 36.0 + 86.0).min(screen.height() - 80.0);
     let panel_rect = Rect::from_center_size(screen.center(), Vec2::new(panel_w, panel_h));
 
-    filled_rect(ui, screen, Color32::from_rgba_unmultiplied(0, 0, 0, 160));
+    // Keep text readable without burying the detail in the background image.
+    filled_rect(ui, screen, Color32::from_rgba_unmultiplied(0, 0, 0, 125));
     rounded_panel(ui, panel_rect, Color32::from_rgb(18, 20, 26));
     ui.painter().rect_stroke(panel_rect, CornerRadius::same(10), Stroke::new(1.0_f32, Color32::from_rgb(45, 52, 65)), egui::StrokeKind::Inside);
 
@@ -2177,9 +2178,9 @@ fn draw_cover_row(ui: &mut egui::Ui, app: &App, screen: Rect, commands: &mut Vec
         let rounding = CornerRadius::same(12);
 
         if t > 0.01 {
-            for i in 0..6 {
-                let g = 1.5 + i as f32 * 2.4;
-                let alpha = (26.0 * t * (1.0 - i as f32 / 6.0)) as u8;
+            for i in 0..2 {
+                let g = 1.8 + i as f32 * 3.6;
+                let alpha = (36.0 * t * (1.0 - i as f32 / 2.0)) as u8;
                 ui.painter().rect_filled(
                     rect.expand(g),
                     CornerRadius::same((12.0 + g) as u8),

@@ -33,7 +33,10 @@ impl TextureKind {
     fn max_decoded_side(self) -> u32 {
         match self {
             TextureKind::Cover => 256,
-            TextureKind::Hero => 960,
+            // Preserve enough detail for a full-screen background.  The
+            // texture cache is still capped, so this can evict old covers but
+            // cannot grow without bound.
+            TextureKind::Hero => 1280,
             TextureKind::Logo => 320,
             TextureKind::Screenshot => 480,
         }
@@ -52,6 +55,8 @@ pub struct TextureCache {
 impl Default for TextureCache {
     fn default() -> Self {
         let (req_tx, req_rx) = sync_channel::<(String, TextureKind, ImageBytes)>(MAX_DECODE_PENDING);
+        // The worker must never stop decoding because the render thread is
+        // briefly busy. The request channel already caps active work at three.
         let (res_tx, res_rx) = channel::<(String, Option<egui::ColorImage>)>();
 
         std::thread::spawn(move || {
@@ -138,8 +143,11 @@ impl TextureCache {
     pub fn invalidate(&mut self, key: &str) {
         self.handles.remove(key);
         self.failed.remove(key);
+        // A newly downloaded image supersedes a queued decode for this key.
+        // Let the new bytes be requested on the next UI frame.
         self.pending.remove(key);
     }
+
 }
 
 const MAX_SOURCE_SIDE: u32 = 2048;
@@ -193,7 +201,14 @@ fn decode((is_png, bytes): &ImageBytes, kind: TextureKind) -> Option<egui::Color
 
     let max_side = kind.max_decoded_side();
     if image.width() > max_side || image.height() > max_side {
-        image = image.resize(max_side, max_side, image::imageops::FilterType::Triangle);
+        let filter = match kind {
+            // Heroes are large gradients/details stretched across the whole
+            // display; the higher-quality filter avoids the soft look from
+            // fast downsampling.
+            TextureKind::Hero => image::imageops::FilterType::Lanczos3,
+            _ => image::imageops::FilterType::Triangle,
+        };
+        image = image.resize(max_side, max_side, filter);
     }
     let rgba = image.to_rgba8();
     let size = [rgba.width() as usize, rgba.height() as usize];

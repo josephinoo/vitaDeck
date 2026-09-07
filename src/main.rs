@@ -37,6 +37,7 @@ use app::App;
 
 fn install_panic_hook() {
     std::panic::set_hook(Box::new(|info| {
+        crate::logger::log(&format!("PANIC: {info}\n{}", crate::logger::current_health_context()));
         let _ = std::fs::create_dir_all("ux0:data/VitaDeck");
         use std::io::Write;
         if let Ok(mut file) =
@@ -58,6 +59,7 @@ fn main() -> anyhow::Result<()> {
         logger::log("previous VitaDeck session ended unexpectedly; restoring normal media loading");
     }
     logger::log("=== VitaDeck starting ===");
+    logger::log("build: store-texture-retirement-v2");
 
     let app = App::new(recovered_from_crash);
     logger::log("App::new completed successfully");

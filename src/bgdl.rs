@@ -255,7 +255,10 @@ fn get_download_class() -> Result<&'static SceDownloadClass> {
         let change_state_func_ptr = *func_table.add(5);
         sce_download_obj.init = Some(std::mem::transmute(init_func_ptr));
         sce_download_obj.change_state = Some(std::mem::transmute(change_state_func_ptr));
-        let init_res2 = sce_download_obj.init.unwrap()(
+        let init_fn = sce_download_obj
+            .init
+            .ok_or_else(|| "SceDownload init export missing".to_string())?;
+        let init_res2 = init_fn(
             (*sce_download_obj.class_header).func_table,
             *(*sce_download_obj.class_header).func_table,
             0x14,
@@ -350,7 +353,10 @@ pub fn start_bgdl(title: &str, url: &str, rif: Option<&[u8]>, bgdl_type: u32) ->
         let p_ptr_to_dc0_ptr = (*init).ptr_to_dc0_ptr;
         log_bgdl(&format!("start_bgdl title='{title}', url='{url}', rif='{rif_str}'"));
 
-        let res_change = sce_download_obj.change_state.unwrap()(
+        let change_state_fn = sce_download_obj
+            .change_state
+            .ok_or_else(|| anyhow::anyhow!("SceDownload change_state export missing"))?;
+        let res_change = change_state_fn(
             (*sce_download_obj.class_header).func_table,
             0x12340012,
             p_ptr_to_dc0_ptr,
@@ -385,7 +391,7 @@ pub fn start_bgdl(title: &str, url: &str, rif: Option<&[u8]>, bgdl_type: u32) ->
             unk_4_2: 0,
             shell_func_8: 0,
         };
-        let res_change2 = sce_download_obj.change_state.unwrap()(
+        let res_change2 = change_state_fn(
             (*sce_download_obj.class_header).func_table,
             0x12340007,
             std::ptr::null_mut(),

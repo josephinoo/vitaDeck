@@ -32,31 +32,33 @@ struct FrameProfiler {
     over_budget: u32,
     max_total: Duration,
     max_cpu: Duration,
+    severe_frames: u32,
+    slowest_paint: surface::FramePaintStats,
 }
 
 impl FrameProfiler {
     fn record(&mut self, total: Duration, cpu: Duration, paint: surface::FramePaintStats) {
         self.frames += 1;
-        self.max_total = self.max_total.max(total);
+        if total >= self.max_total {
+            self.max_total = total;
+            self.slowest_paint = paint;
+        }
         self.max_cpu = self.max_cpu.max(cpu);
         if total > FRAME_BUDGET { self.over_budget += 1; }
         if total > SEVERE_FRAME {
-            crate::logger::log(&format!(
-                "slow frame {:.1}ms (cpu {:.1}ms, textures {:.1}ms, geometry {:.1}ms, present {:.1}ms)",
-                total.as_secs_f64() * 1000.0,
-                cpu.as_secs_f64() * 1000.0,
-                paint.texture_apply_secs * 1000.0,
-                paint.geometry_secs * 1000.0,
-                paint.present_secs * 1000.0,
-            ));
+            self.severe_frames += 1;
         }
         if self.frames >= FRAME_REPORT_INTERVAL {
             crate::logger::log(&format!(
-                "frames: {}/{} over 16.7ms; max {:.1}ms total / {:.1}ms cpu",
+                "frames: {}/{} over 16.7ms; max {:.1}ms total / {:.1}ms cpu; {} severe; slowest textures {:.1}ms geometry {:.1}ms present {:.1}ms",
                 self.over_budget,
                 self.frames,
                 self.max_total.as_secs_f64() * 1000.0,
                 self.max_cpu.as_secs_f64() * 1000.0,
+                self.severe_frames,
+                self.slowest_paint.texture_apply_secs * 1000.0,
+                self.slowest_paint.geometry_secs * 1000.0,
+                self.slowest_paint.present_secs * 1000.0,
             ));
             *self = Self::default();
         }
@@ -66,6 +68,9 @@ impl FrameProfiler {
 pub fn run(mut app: App) -> Result<()> {
     crate::logger::log("shell::run: sdl2::init()");
     let sdl = sdl2::init().map_err(anyhow::Error::msg)?;
+    sdl2::log::set_output_function(|priority, category, message| {
+        crate::logger::log(&format!("SDL {priority:?} {category:?}: {message}"));
+    });
     crate::logger::log("shell::run: video subsystem");
     let video = sdl.video().map_err(anyhow::Error::msg)?;
     let _ = register_vita_controller_mapping(&sdl);
@@ -199,6 +204,9 @@ pub fn run(mut app: App) -> Result<()> {
         let total = frame_started_at.elapsed();
         let cpu = cpu_started_at.elapsed().saturating_sub(Duration::from_secs_f64(paint.present_secs));
         frame_profiler.record(total, cpu, paint);
+        if frame_count % 300 == 0 {
+            surface.log_resources();
+        }
         if log_frame {
             crate::logger::log(&format!("frame {}: DONE ✓", frame_count));
         }

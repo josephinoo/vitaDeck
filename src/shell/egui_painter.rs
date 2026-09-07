@@ -9,9 +9,9 @@ const RETRIES_PER_FRAME: usize = 2;
 const MAX_UPLOAD_ATTEMPTS: u32 = 8;
 const BACKOFF_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 
-const NEW_TEXTURES_PER_FRAME: usize = 1;
+const NEW_TEXTURES_PER_FRAME: usize = 2;
 
-const MAX_PENDING_UPLOADS: usize = 4;
+const MAX_PENDING_UPLOADS: usize = 16;
 
 fn is_font_texture(id: egui::TextureId) -> bool {
 
@@ -24,14 +24,22 @@ fn is_small_ui_texture(size: [usize; 2]) -> bool {
 #[derive(Default)]
 pub struct SdlEguiPainter {
     textures: HashMap<egui::TextureId, SdlEguiTexture>,
+    retired: Vec<SdlEguiTexture>,
     pending: HashMap<egui::TextureId, PendingUpload>,
     vertices: Vec<sdl2::render::Vertex>,
     indices: Vec<i32>,
     scratch: Vec<u8>,
 }
 struct SdlEguiTexture {
-    texture: sdl2::render::Texture,
+    texture: Option<sdl2::render::Texture>,
     uv_scale: egui::Vec2,
+}
+impl Drop for SdlEguiTexture {
+    fn drop(&mut self) {
+        if let Some(texture) = self.texture.take() {
+            unsafe { texture.destroy() };
+        }
+    }
 }
 struct PendingUpload {
     size: [usize; 2],
@@ -79,7 +87,12 @@ impl SdlEguiPainter {
             }
             let uv_scale = match self.textures.get(&mesh.texture_id) {
                 Some(t) => t.uv_scale,
-                None if mesh.texture_id != egui::TextureId::default() => continue,
+                None if mesh.texture_id != egui::TextureId::default() => {
+                    self.flush_batch(canvas, current_texture_id, &mut draw_calls, &mut vertices_drawn);
+                    current_clip = None;
+                    current_texture_id = None;
+                    continue;
+                }
                 None => egui::vec2(1.0, 1.0),
             };
             let same_batch = current_clip == Some(clip_rect) && current_texture_id == Some(mesh.texture_id);
@@ -110,9 +123,19 @@ impl SdlEguiPainter {
         pos.is_none() || !self.textures.contains_key(&texture_id)
     }
     fn destroy_texture(&mut self, id: egui::TextureId) {
-        if let Some(entry) = self.textures.remove(&id) {
-            unsafe { entry.texture.destroy() };
+        if let Some(texture) = self.textures.remove(&id) {
+            // SDL may still have queued geometry referencing this texture.
+            // Keep it alive through RenderPresent, then let GXM synchronize
+            // destruction after the frame has been submitted.
+            self.retired.push(texture);
         }
+    }
+    pub fn after_present(&mut self) {
+        self.retired.clear();
+    }
+    pub fn resource_counts(&self) -> (usize, usize, usize) {
+        (self.textures.len(), self.pending.len(),
+            self.pending.values().map(|upload| upload.pixels.len()).sum())
     }
     fn flush_batch(
         &mut self,
@@ -126,7 +149,9 @@ impl SdlEguiPainter {
             self.indices.clear();
             return;
         }
-        let texture_ref = texture_id.and_then(|id| self.textures.get(&id)).map(|t| &t.texture);
+        let texture_ref = texture_id
+            .and_then(|id| self.textures.get(&id))
+            .and_then(|t| t.texture.as_ref());
         if let Err(err) = canvas.render_geometry(&self.vertices, texture_ref, &self.indices) {
             eprintln!("skipped a draw call: {err}");
         } else {
@@ -176,10 +201,10 @@ impl SdlEguiPainter {
                 .iter()
                 .filter(|(id, upload)| !is_font_texture(**id) && upload.next_retry_at <= now)
                 .map(|(id, _)| *id)
-                .take(RETRIES_PER_FRAME.min(NEW_TEXTURES_PER_FRAME) + 1)
+                .take(RETRIES_PER_FRAME.min(NEW_TEXTURES_PER_FRAME.saturating_sub(new_creations)))
                 .collect();
             for texture_id in retry {
-                let upload = self.pending.remove(&texture_id).expect("key came from the map");
+                let Some(upload) = self.pending.remove(&texture_id) else { continue };
                 self.upload(canvas, texture_id, upload.size, upload.pos, &upload.pixels, upload.attempts);
                 new_creations += 1;
                 uploaded += 1;
@@ -318,11 +343,12 @@ impl SdlEguiPainter {
             texture.set_blend_mode(BlendMode::Blend);
             if let Err(err) = texture.update(Rect::new(0, 0, width as u32, height as u32), pixels, width * 4) {
                 eprintln!("couldn't upload a texture, will retry: {err}");
+                unsafe { texture.destroy() };
                 self.defer_or_give_up(texture_id, size, pos, pixels, attempts);
                 return;
             }
             self.destroy_texture(texture_id);
-            self.textures.insert(texture_id, SdlEguiTexture { texture, uv_scale: egui::vec2(1.0, 1.0) });
+            self.textures.insert(texture_id, SdlEguiTexture { texture: Some(texture), uv_scale: egui::vec2(1.0, 1.0) });
             return;
         }
         let Some([x, y]) = pos else {
@@ -333,10 +359,12 @@ impl SdlEguiPainter {
             eprintln!("partial update for a texture that no longer exists, skipped");
             return;
         };
-        if let Err(err) =
-            existing.texture.update(Rect::new(x as i32, y as i32, width as u32, height as u32), pixels, width * 4)
-        {
-            eprintln!("couldn't patch a texture: {err}");
+        if let Some(existing_tex) = existing.texture.as_mut() {
+            if let Err(err) =
+                existing_tex.update(Rect::new(x as i32, y as i32, width as u32, height as u32), pixels, width * 4)
+            {
+                eprintln!("couldn't patch a texture: {err}");
+            }
         }
     }
     fn fill_sdl_rgba(image: &egui::ImageData, out: &mut Vec<u8>) {
@@ -349,8 +377,10 @@ impl SdlEguiPainter {
                 out.extend_from_slice(bytes);
             }
             egui::ImageData::Font(image) => {
-                for pixel in image.srgba_pixels(None) {
-                    out.extend_from_slice(&pixel.to_srgba_unmultiplied());
+                out.reserve(image.pixels.len() * 4);
+                for &coverage in &image.pixels {
+                    let a = (coverage * 255.0).round().clamp(0.0, 255.0) as u8;
+                    out.extend_from_slice(&[255, 255, 255, a]);
                 }
             }
         }
@@ -413,11 +443,63 @@ impl SdlEguiPainter {
 mod tests {
     use super::*;
     #[test]
+    #[ignore = "requires SDL_VIDEODRIVER=dummy; run separately from other SDL tests"]
+    fn rapid_texture_turnover_retires_only_after_present() {
+        let sdl = sdl2::init().unwrap();
+        let video = sdl.video().unwrap();
+        let window = video.window("texture lifecycle", 64, 64).hidden().build().unwrap();
+        let mut canvas = window.into_canvas().software().build().unwrap();
+        let mut painter = SdlEguiPainter::default();
+        for frame in 1..=500 {
+            let id = egui::TextureId::Managed(frame);
+            let mut mesh = egui::Mesh::with_texture(id);
+            let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(32.0, 32.0));
+            mesh.add_rect_with_uv(rect, egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)), egui::Color32::WHITE);
+            let delta = egui::TexturesDelta {
+                set: vec![(id, egui::epaint::ImageDelta::full(
+                    egui::ColorImage::new([32, 32], egui::Color32::WHITE), egui::TextureOptions::LINEAR))],
+                free: vec![id],
+            };
+            let primitives = [egui::ClippedPrimitive { clip_rect: rect,
+                primitive: egui::epaint::Primitive::Mesh(mesh) }];
+            painter.paint(&mut canvas, [64, 64], 1.0, &primitives, &delta).unwrap();
+            assert!(painter.textures.is_empty());
+            assert_eq!(painter.retired.len(), 1);
+            canvas.present();
+            painter.after_present();
+            assert!(painter.retired.is_empty());
+            assert!(painter.pending.is_empty());
+        }
+    }
+    #[test]
     fn texture_coordinates_stay_inside_the_range_sdl_accepts() {
         let (x, y) = SdlEguiPainter::uv_for_test(egui::vec2(-1e-7, 1.0000002), egui::vec2(1.0, 1.0));
         assert_eq!((x, y), (0.0, 1.0));
         assert!(x.is_sign_positive(), "a negative zero is still out of bounds for SDL");
         let (x, y) = SdlEguiPainter::uv_for_test(egui::vec2(0.25, 0.78), egui::vec2(1.0, 1.0));
         assert_eq!((x, y), (0.25, 0.78));
+    }
+
+    #[test]
+    fn test_enqueue_pending_eviction() {
+        let mut painter = SdlEguiPainter::default();
+        let now = std::time::Instant::now();
+        // Insert MAX_PENDING_UPLOADS textures
+        for i in 1..=MAX_PENDING_UPLOADS {
+            let id = egui::TextureId::User(i as u64);
+            painter.enqueue_pending(id, [10, 10], None, &[0; 100], 0, now);
+        }
+        assert_eq!(painter.pending.len(), MAX_PENDING_UPLOADS);
+
+        // Enqueue an extra texture, which triggers eviction of the largest/victim
+        let extra_id = egui::TextureId::User(999);
+        painter.enqueue_pending(extra_id, [20, 20], None, &[0; 400], 0, now);
+        assert_eq!(painter.pending.len(), MAX_PENDING_UPLOADS);
+
+        // Verifying that removing an evicted ID returns None and does not panic
+        let missing = egui::TextureId::User(1);
+        let removed = painter.pending.remove(&missing);
+        // It could be Some or None depending on which was evicted, but handling None cleanly with ? or match is safe
+        let _ = removed;
     }
 }

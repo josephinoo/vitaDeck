@@ -20,7 +20,11 @@ const SCROLL_LERP: f32 = 0.22;
 
 const MAX_ART_JOBS_IN_FLIGHT: usize = 2;
 
-const STORE_ART_JOBS_IN_FLIGHT: usize = 2;
+// Store artwork is served remotely.  Keep it deliberately serial so a fast
+// scroll cannot turn into a burst that gets the Vita's IP rate-limited.
+const STORE_ART_JOBS_IN_FLIGHT: usize = 1;
+const STORE_SCROLL_SETTLE_FRAMES: u64 = 12;
+const STORE_ART_INTERVAL_FRAMES: u64 = 18;
 const ART_DOWNLOAD_WORKERS: usize = 2;
 
 const COVER_KEEP_RADIUS: usize = 18;
@@ -127,6 +131,8 @@ pub struct App {
     known_art: HashMap<String, KnownArt>,
 
     art_jobs_in_flight: usize,
+    store_last_selected: Option<usize>,
+    store_next_art_frame: u64,
     request_tx: Option<mpsc::SyncSender<ArtJob>>,
     done_rx: Option<mpsc::Receiver<ArtResult>>,
     scan_rx: Option<mpsc::Receiver<(Vec<Game>, Vec<String>)>>,
@@ -172,6 +178,7 @@ pub struct App {
     pub scan_folders: Vec<String>,
     collection_create_pending: bool,
     rename_pending: Option<String>,
+    loaded_store_indices: HashSet<usize>,
 }
 
 impl App {
@@ -326,6 +333,8 @@ impl App {
             art_state: HashMap::new(),
             known_art,
             art_jobs_in_flight: 0,
+            store_last_selected: None,
+            store_next_art_frame: 0,
             request_tx,
             done_rx,
             scan_rx: Some(scan_rx),
@@ -371,6 +380,7 @@ impl App {
             scan_folders: Vec::new(),
             collection_create_pending: false,
             rename_pending: None,
+            loaded_store_indices: HashSet::new(),
         };
         app.rebuild_library_indexes();
         let _ = recovered_from_crash;
@@ -604,6 +614,24 @@ impl App {
         if !self.net_ready {
             return;
         }
+        if self.is_store_tab() {
+            // Navigation is often much faster than an HTTP round trip.  Do
+            // not start a cover until the cursor has stopped briefly, then
+            // admit just one request every few frames.  Together with the
+            // one-job Store budget this eliminates stale queued requests.
+            if self.store_last_selected != Some(self.selected) {
+                self.store_last_selected = Some(self.selected);
+                self.store_next_art_frame = self
+                    .frame_counter
+                    .saturating_add(STORE_SCROLL_SETTLE_FRAMES);
+                return;
+            }
+            if self.frame_counter < self.store_next_art_frame {
+                return;
+            }
+        } else {
+            self.store_last_selected = None;
+        }
         if self.art_jobs_in_flight >= self.art_jobs_budget() {
             return;
         }
@@ -627,12 +655,12 @@ impl App {
             None
         };
         let final_cover_url = if is_store {
-            // Prefer the feed's medium artwork. This is the route the store
-            // cache has already proven compatible with Vita/Vita3K. The
-            // title-ID route remains a fallback for records without a cover.
-            store_item
-                .and_then(|i| i.resolved_cover_url())
-                .or_else(|| crate::store::cover_url_for_title_id(&game.title_id))
+            // The catalog artwork URLs can expire or point at a CDN that
+            // rejects the Vita TLS client.  The title-ID API is stable and
+            // carries our X-Client-ID header, so use it first.  The catalog
+            // URL remains a second chance below.
+            crate::store::cover_url_for_title_id(&game.title_id)
+                .or_else(|| store_item.and_then(|i| i.resolved_cover_url()))
                 .or(known.cover_url)
         } else {
             known.cover_url.or_else(|| {
@@ -648,7 +676,13 @@ impl App {
         // a portrait cover with a landscape gameplay image.
         let known_screenshot_url = if is_store { None } else { known.screenshot_url };
         let known_icon_url = if is_store {
-            store_item.and_then(|i| i.resolved_icon_url())
+            // `resolve` tries this after `known_cover_url`.  Supplying the
+            // catalog cover here gives Store a real fallback if the stable
+            // title-ID endpoint has no asset, rather than falling straight
+            // to the small icon.
+            store_item
+                .and_then(|i| i.resolved_cover_url())
+                .or_else(|| store_item.and_then(|i| i.resolved_icon_url()))
         } else {
             None
         };
@@ -671,6 +705,11 @@ impl App {
         if let Some(tx) = &self.request_tx {
             if tx.try_send(job).is_ok() {
                 self.art_jobs_in_flight += 1;
+                if is_store {
+                    self.store_next_art_frame = self
+                        .frame_counter
+                        .saturating_add(STORE_ART_INTERVAL_FRAMES);
+                }
             }
         }
     }
@@ -746,10 +785,11 @@ impl App {
         let stride = card_row_stride(SCREEN_W).max(1.0);
         let view_h = (SCREEN_H - HEADER_H - FOOTER_H).max(1.0);
         let first_row = (self.current_scroll / stride).floor().max(0.0) as usize;
+        let start_row = first_row.saturating_sub(1);
         let rows_on_screen = ((view_h / stride).ceil() as usize).max(1);
-        let start = first_row.saturating_mul(GRID_COLS);
-        let end = start
-            .saturating_add((rows_on_screen + 1).saturating_mul(GRID_COLS))
+        let start = start_row.saturating_mul(GRID_COLS);
+        let end = (first_row + rows_on_screen + 2)
+            .saturating_mul(GRID_COLS)
             .saturating_add(self.art_lookahead())
             .min(self.visible.len());
         (start, end)
@@ -808,9 +848,10 @@ impl App {
         );
         if !self.is_store_tab() {
             self.visible.retain(|&index| {
-                self.games
-                    .get(index)
-                    .is_some_and(|game| !self.config.title_is_hidden(&game.title_id))
+                index < self.games.len()
+                    && self.games
+                        .get(index)
+                        .is_some_and(|game| !self.config.title_is_hidden(&game.title_id))
             });
         }
         // The dedicated RECENT tab has an explicit user-history order and the
@@ -822,8 +863,9 @@ impl App {
             let sort = self.config.library_sort;
             let stats = &self.stats;
             self.visible.sort_by(|left, right| {
-                let a = &self.games[*left];
-                let b = &self.games[*right];
+                let (Some(a), Some(b)) = (self.games.get(*left), self.games.get(*right)) else {
+                    return std::cmp::Ordering::Equal;
+                };
                 let by_name = || a.title.to_lowercase().cmp(&b.title.to_lowercase());
                 match sort {
                     crate::config::LibrarySort::Name => by_name(),
@@ -916,9 +958,12 @@ impl App {
                     }
                 }
 
-                crate::cache_manager::clean_orphaned_cache(&self.games);
-                crate::cache_manager::enforce_cache_budget(&self.games, self.config.cache_budget_mb);
-                self.cache_stats = crate::cache_manager::compute_cache_stats(&self.games);
+                let games_clone = self.games.clone();
+                let budget_mb = self.config.cache_budget_mb;
+                std::thread::spawn(move || {
+                    crate::cache_manager::clean_orphaned_cache(&games_clone);
+                    crate::cache_manager::enforce_cache_budget(&games_clone, budget_mb);
+                });
                 self.installed_title_ids = self
                     .games
                     .iter()
@@ -1129,7 +1174,14 @@ impl App {
                 let selected_title_id =
                     self.visible.get(self.selected).and_then(|&i| self.games.get(i)).map(|g| g.title_id.clone());
 
-                let store_index = self.store.index_by_title_id(&title_id);
+                // Catalog indices are normally aligned with store_games, but
+                // a cached catalog can be older than the game list.  Route a
+                // downloaded cover by title ID in the actual render list so
+                // valid images are never silently discarded.
+                let store_index = self
+                    .store_games
+                    .iter()
+                    .position(|game| game.title_id.eq_ignore_ascii_case(&title_id));
                 let store_wants_cover = store_index
                     .is_some_and(|index| self.is_store_tab() && self.cover_keep_set().contains(&index));
                 let mut cover = cover;
@@ -1189,6 +1241,7 @@ impl App {
                         if let Some(game) = self.store_games.get_mut(index) {
                             if let Some(cover_bytes) = cover.take() {
                                 game.cover_bytes = Some((cover_bytes.is_png, cover_bytes.bytes));
+                                self.loaded_store_indices.insert(index);
                                 self.texture_cache.borrow_mut().invalidate(&format!(
                                     "{}:{}:cover",
                                     game.system.label(),
@@ -1267,7 +1320,8 @@ impl App {
 
         for _ in 0..MAX_LOCAL_ART_RESULTS_PER_FRAME {
             let Ok(result) = self.local_art_rx.try_recv() else { break };
-            self.local_art_pending.retain(|key| !key.starts_with(&format!("{}:", result.title_id)));
+            self.local_art_pending.remove(&format!("{}:{}:{}:{}", result.title_id,
+                result.cover_requested as u8, result.hero_requested as u8, result.logo_requested as u8));
             if let Some(game) = self.games.iter_mut().find(|g| g.art_key == result.art_key) {
                 if let Some(h) = result.hero {
                     game.hero_bytes = Some(h);
@@ -1282,12 +1336,13 @@ impl App {
                 if result.hero_requested && game.hero_bytes.is_none() { game.has_hero = false; }
                 if result.logo_requested && game.logo_bytes.is_none() { game.has_logo = false; }
             }
-            if let Some(game) = self
-                .store
-                .index_by_title_id(&result.title_id)
-                .and_then(|index| self.store_games.get_mut(index))
-            {
-                if let Some(c) = result.cover { game.cover_bytes = Some(c); }
+            if let Some(index) = self.store.index_by_title_id(&result.title_id) {
+                if let Some(game) = self.store_games.get_mut(index) {
+                    if let Some(c) = result.cover {
+                        game.cover_bytes = Some(c);
+                        self.loaded_store_indices.insert(index);
+                    }
+                }
             }
         }
 
@@ -1350,7 +1405,7 @@ impl App {
 
     const MUSIC_SETTLE_FRAMES: u32 = 18;
 
-    const ART_SETTLE_FRAMES: u32 = 2;
+    const ART_SETTLE_FRAMES: u32 = 14;
 
     fn pump_music(&mut self, selected_index: Option<usize>) {
         if self.safe_mode || self.is_settings() || self.is_store_tab() || selected_index.is_none() {
@@ -1442,7 +1497,7 @@ impl App {
 
     fn request_local_art(&mut self, title_id: String, art_key: String, system: System, cover: bool, hero: bool, logo: bool) {
         let key = format!("{}:{}:{}:{}", title_id, cover as u8, hero as u8, logo as u8);
-        if !self.local_art_pending.insert(key) {
+        if !self.local_art_pending.insert(key.clone()) {
             return;
         }
         let request = LocalArtRequest {
@@ -1454,14 +1509,19 @@ impl App {
             logo,
         };
         if self.local_art_tx.try_send(request).is_err() {
-            self.local_art_pending.clear();
+            self.local_art_pending.remove(&key);
         }
     }
 
     fn drop_store_cover(&mut self, index: usize) {
         let Some(game) = self.store_games.get_mut(index) else { return };
+        let cover_key = format!("{}:{}:cover", game.system.label(), game.title_id);
+        let hero_key = format!("{}:{}:hero", game.system.label(), game.title_id);
         game.cover_bytes = None;
         game.hero_bytes = None;
+        let mut cache = self.texture_cache.borrow_mut();
+        cache.invalidate(&cover_key);
+        cache.invalidate(&hero_key);
         let title_id = game.title_id.clone();
         if !matches!(self.art_state.get(&title_id), Some(ArtState::Pending)) {
             self.art_state.remove(&title_id);
@@ -1472,17 +1532,13 @@ impl App {
         let cover_keep = self.cover_keep_set();
         if self.is_store_tab() {
             let drop: Vec<usize> = self
-                .store_games
+                .loaded_store_indices
                 .iter()
-                .enumerate()
-                .filter(|(index, game)| {
-                    Some(*index) != selected_index
-                        && (game.cover_bytes.is_some() || game.hero_bytes.is_some())
-                        && !cover_keep.contains(index)
-                })
-                .map(|(index, _)| index)
+                .copied()
+                .filter(|&index| Some(index) != selected_index && !cover_keep.contains(&index))
                 .collect();
             for index in drop {
+                self.loaded_store_indices.remove(&index);
                 self.drop_store_cover(index);
             }
             return;
@@ -2738,9 +2794,15 @@ fn filter_store_games(
         .filter(|&i| {
             store_games.get(i).is_some_and(|game| {
                 let matches_query = query.is_empty() || contains_ignore_case(&game.title, &query);
-                let matches_region = store
-                    .item_by_title_id(&game.title_id)
-                    .is_some_and(|item| store_item_matches_regions(item, store_regions));
+                // “All” must be a direct view of `store_games`. Requiring a
+                // second lookup here made the whole Store empty when an old
+                // cache had an incomplete title index.
+                let matches_region = store_regions.is_empty()
+                    || store
+                        .item_by_title_id(&game.title_id)
+                        // Missing metadata is not a reason to hide a game.
+                        .map(|item| store_item_matches_regions(item, store_regions))
+                        .unwrap_or(true);
                 matches_query && matches_region
             })
         })
@@ -2751,14 +2813,41 @@ fn store_item_matches_regions(item: &StoreItem, selected_regions: &[String]) -> 
     if selected_regions.is_empty() {
         return true;
     }
-    item.region
-        .as_deref()
-        .map(str::trim)
-        .is_some_and(|region| {
-            selected_regions
-                .iter()
-                .any(|selected| region.eq_ignore_ascii_case(selected))
-        })
+    let Some(region) = item.region.as_deref() else {
+        // Older catalog entries are not region-tagged. They must remain
+        // discoverable when a Store region is selected.
+        return true;
+    };
+    let actual = canonical_store_region(region);
+    selected_regions
+        .iter()
+        .filter_map(|selected| canonical_store_region(selected))
+        .any(|selected| actual == Some(selected))
+}
+
+fn canonical_store_region(region: &str) -> Option<&'static str> {
+    let normalized = region.trim().to_ascii_uppercase();
+    if normalized.is_empty() {
+        return None;
+    }
+    let words: Vec<&str> = normalized
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .collect();
+    let has = |word: &str| words.iter().any(|candidate| *candidate == word);
+    if has("US") || has("USA") || has("UNITED") || has("AMERICA") || has("NA") {
+        Some("US")
+    } else if has("EU") || has("EUR") || has("EUROPE") || has("EUROPEAN") {
+        Some("EU")
+    } else if has("JP") || has("JPN") || has("JAPAN") || has("JAPANESE") {
+        Some("JP")
+    } else if has("ASIA") || has("ASIAN") || has("KR") || has("KOR") || has("KOREA") || has("CN") || has("CHINA") {
+        Some("ASIA")
+    } else if has("INT") || has("INTERNATIONAL") || has("GLOBAL") || has("WORLD") || has("WORLDWIDE") {
+        Some("INT")
+    } else {
+        None
+    }
 }
 
 fn contains_ignore_case(haystack: &str, needle: &str) -> bool {
@@ -2836,5 +2925,16 @@ mod tab_tests {
         assert!(store_item_matches_regions(&item, &[]));
         assert!(store_item_matches_regions(&item, &["EU".to_owned(), "US".to_owned()]));
         assert!(!store_item_matches_regions(&item, &["JP".to_owned(), "ASIA".to_owned()]));
+    }
+
+    #[test]
+    fn store_region_filter_accepts_catalog_region_names() {
+        let selected = ["US".to_owned()];
+        for region in ["US", "USA", "United States", "North America"] {
+            let item: StoreItem = serde_json::from_str(&format!(
+                r#"{{"title_id":"PCSE00001","name":"Test","region":"{region}","download_url":"https://example.com/game"}}"#
+            )).unwrap();
+            assert!(store_item_matches_regions(&item, &selected), "{region}");
+        }
     }
 }

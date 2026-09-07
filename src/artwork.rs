@@ -49,7 +49,10 @@ pub struct ArtResult {
 }
 
 const MAX_JSON_BYTES: usize = 64 * 1024;
-const MAX_IMAGE_BYTES: usize = 2 * 1024 * 1024;
+// Store cover JPEGs are decoded and downscaled immediately, and only two art
+// jobs run concurrently.  Four MiB avoids rejecting normal medium artwork
+// while bounding the worst transient allocation to eight MiB.
+const MAX_IMAGE_BYTES: usize = 4 * 1024 * 1024;
 
 const MAX_MUSIC_BYTES: usize = 12 * 1024 * 1024;
 

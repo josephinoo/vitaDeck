@@ -44,7 +44,7 @@ impl WavSound {
                 sample_rate = u32::from_le_bytes(bytes[pos + 4..pos + 8].try_into().ok()?);
                 fmt_found = true;
             } else if chunk_id == b"data" && pos + chunk_size <= bytes.len() {
-                if !fmt_found {
+                if !fmt_found || sample_rate == 0 || channels == 0 {
                     return None;
                 }
                 let pcm_bytes = &bytes[pos..pos + chunk_size];
@@ -64,6 +64,9 @@ impl WavSound {
     }
 
     fn to_mono_48000(&self) -> WavSound {
+        if self.sample_rate == 0 {
+            return self.clone();
+        }
         let channels = self.channels.max(1) as usize;
         let mono: Vec<i16> = self
             .samples
@@ -756,17 +759,21 @@ fn decode_and_feed_mp3(
 
                 let decode_rc = sceAudiodecDecode(c);
                 if decode_rc >= 0 && c.outputPcmSize > 0 {
-                    let sample_count = (c.outputPcmSize / 2) as usize;
+                    let sample_count = ((c.outputPcmSize / 2) as usize).min(pcm_buf.len);
                     let raw_samples = &pcm_buf.as_slice()[..sample_count];
 
                     let stereo_slice: &[i16] = if frame.channels == 1 {
+                        let target_len = (sample_count * 2).min(stereo_converter.len());
                         let mut out_idx = 0;
                         for &s in raw_samples {
+                            if out_idx + 1 >= stereo_converter.len() {
+                                break;
+                            }
                             stereo_converter[out_idx] = s;
                             stereo_converter[out_idx + 1] = s;
                             out_idx += 2;
                         }
-                        &stereo_converter[..sample_count * 2]
+                        &stereo_converter[..target_len]
                     } else {
                         raw_samples
                     };
@@ -815,3 +822,54 @@ fn decode_and_feed_mp3(
 
     outcome
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_wav_sound_rejects_zero_sample_rate_and_channels() {
+        let mut header = vec![
+            b'R', b'I', b'F', b'F',
+            36, 0, 0, 0,
+            b'W', b'A', b'V', b'E',
+            b'f', b'm', b't', b' ',
+            16, 0, 0, 0,
+            1, 0,       // PCM format
+            0, 0,       // 0 channels!
+            0, 0, 0, 0, // 0 sample rate!
+            0, 0, 0, 0, // byte rate
+            0, 0,       // block align
+            16, 0,      // bits per sample
+            b'd', b'a', b't', b'a',
+            4, 0, 0, 0,
+            0, 0, 0, 0,
+        ];
+        assert!(WavSound::parse(&header).is_none());
+
+        // Now test zero sample rate with valid channels
+        header[22] = 1; // 1 channel
+        assert!(WavSound::parse(&header).is_none());
+
+        // Now test valid sample rate
+        header[24] = 0x44;
+        header[25] = 0xAC; // 44100 Hz
+        let wav = WavSound::parse(&header);
+        assert!(wav.is_some());
+        let converted = wav.unwrap().to_mono_48000();
+        assert_eq!(converted.sample_rate, 48000);
+        assert_eq!(converted.channels, 1);
+    }
+
+    #[test]
+    fn test_to_mono_48000_zero_sample_rate_does_not_panic() {
+        let bad_wav = WavSound {
+            sample_rate: 0,
+            channels: 0,
+            samples: vec![100, 200],
+        };
+        let converted = bad_wav.to_mono_48000();
+        assert_eq!(converted.sample_rate, 0);
+    }
+}
+
